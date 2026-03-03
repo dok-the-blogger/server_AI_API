@@ -5,9 +5,11 @@ from gigachat import GigaChat
 
 from config import settings
 from routers import chat
+from profiles import load_profiles
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_profiles()
     if settings.GIGACHAT_CREDENTIALS:
         async with GigaChat(credentials=settings.GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
             app.state.gigachat_client = client

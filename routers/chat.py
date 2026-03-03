@@ -4,6 +4,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from gigachat.models import Chat
 
 from config import settings
+from profiles import get_system_prompt
 
 router = APIRouter()
 
@@ -29,30 +30,37 @@ async def chat(
         if not authorization or authorization != f"Bearer {settings.API_TOKEN}":
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if request.profile in (None, "", "default"):
-        client = getattr(request_obj.app.state, "gigachat_client", None)
-        if client is None:
-            raise HTTPException(status_code=500, detail="GigaChat client is not initialized")
+    client = getattr(request_obj.app.state, "gigachat_client", None)
+    if client is None:
+        raise HTTPException(status_code=500, detail="GigaChat client is not initialized")
 
-        messages = []
-        if request.context:
-            if "system" in request.context and isinstance(request.context["system"], str):
-                messages.append({"role": "system", "content": request.context["system"]})
-            if "history" in request.context and isinstance(request.context["history"], list):
-                messages.extend(request.context["history"])
+    system_prompt = None
 
-        messages.append({"role": "user", "content": request.message})
+    if request.profile:
+        system_prompt = get_system_prompt(request.profile)
+        if system_prompt is None and request.profile not in (None, "", "default"):
+            raise HTTPException(status_code=400, detail=f"Unknown profile: {request.profile}")
 
-        try:
-            chat_payload = Chat(messages=messages, model=settings.GIGACHAT_MODEL)
-            response = await client.achat(chat_payload)
+    if request.context and "system" in request.context and isinstance(request.context["system"], str):
+        system_prompt = request.context["system"]
 
-            if response.choices[0].finish_reason == "blacklist":
-                return ChatResponse(response="", session_id=request.session_id, filtered=True)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
 
-            content = response.choices[0].message.content
-            return ChatResponse(response=content, session_id=request.session_id)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+    if request.context and "history" in request.context and isinstance(request.context["history"], list):
+        messages.extend(request.context["history"])
 
-    raise HTTPException(status_code=400, detail=f"Unknown profile: {request.profile}")
+    messages.append({"role": "user", "content": request.message})
+
+    try:
+        chat_payload = Chat(messages=messages, model=settings.GIGACHAT_MODEL)
+        response = await client.achat(chat_payload)
+
+        if response.choices[0].finish_reason == "blacklist":
+            return ChatResponse(response="", session_id=request.session_id, filtered=True)
+
+        content = response.choices[0].message.content
+        return ChatResponse(response=content, session_id=request.session_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
