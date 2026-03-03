@@ -17,6 +17,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     session_id: Optional[str] = None
+    filtered: bool = False
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
@@ -45,6 +46,10 @@ async def chat(
         try:
             chat_payload = Chat(messages=messages, model=settings.GIGACHAT_MODEL)
             response = await client.achat(chat_payload)
+
+            if response.choices[0].finish_reason == "blacklist":
+                return ChatResponse(response="", session_id=request.session_id, filtered=True)
+
             content = response.choices[0].message.content
             return ChatResponse(response=content, session_id=request.session_id)
         except Exception as e:
