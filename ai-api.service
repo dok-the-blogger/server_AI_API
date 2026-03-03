@@ -1,0 +1,15 @@
+[Unit]
+Description=AI API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ai-api
+EnvironmentFile=/opt/ai-api/.env
+ExecStart=/opt/ai-api/venv/bin/uvicorn main:app --host 127.0.0.1 --port 9000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
