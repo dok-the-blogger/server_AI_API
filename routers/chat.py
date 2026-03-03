@@ -42,7 +42,10 @@ async def chat(
         messages.append({"role": "user", "content": request.message})
 
         try:
-            response = await client.achat(messages=messages, model="GigaChat-2-Lite")
+            response = await client.achat({
+                "messages": messages,
+                "model": "GigaChat-2-Lite",
+            })
             content = response.choices[0].message.content
             return ChatResponse(response=content, session_id=request.session_id)
         except Exception as e:
