@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Request
+from gigachat.models import Chat
 
 from config import settings
 
@@ -42,13 +43,11 @@ async def chat(
         messages.append({"role": "user", "content": request.message})
 
         try:
-            response = await client.achat({
-                "messages": messages,
-                "model": "GigaChat-2-Lite",
-            })
+            chat_payload = Chat(messages=messages, model=settings.GIGACHAT_MODEL)
+            response = await client.achat(chat_payload)
             content = response.choices[0].message.content
             return ChatResponse(response=content, session_id=request.session_id)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    return ChatResponse(response="OK", session_id=request.session_id)
+    raise HTTPException(status_code=400, detail=f"Unknown profile: {request.profile}")
