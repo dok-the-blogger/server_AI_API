@@ -27,3 +27,10 @@ def get_system_prompt(name: str) -> Optional[str]:
     if profile:
         return profile.get("system_prompt")
     return None
+
+def get_fallback_prompt(name: str) -> Optional[str]:
+    """Получить запасной (fallback) промпт профиля для обхода blacklist"""
+    profile = _profiles.get(name)
+    if profile:
+        return profile.get("fallback_system_prompt")
+    return None

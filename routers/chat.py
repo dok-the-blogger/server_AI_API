@@ -1,12 +1,24 @@
 from pydantic import BaseModel
 from typing import Optional
+import json
 from fastapi import APIRouter, Header, HTTPException, Request
 from gigachat.models import Chat
 
 from config import settings
-from profiles import get_system_prompt
+from profiles import get_system_prompt, get_fallback_prompt
 
 router = APIRouter()
+
+def parse_json_reply(text: str) -> str:
+    """Извлекает поле reply из JSON-ответа модели. При ошибке возвращает raw text."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        data = json.loads(text)
+        return data.get("reply", text)
+    except (json.JSONDecodeError, AttributeError):
+        return text
 
 class ChatRequest(BaseModel):
     message: str
@@ -58,6 +70,23 @@ async def chat(
         response = await client.achat(chat_payload)
 
         if response.choices[0].finish_reason == "blacklist":
+            if request.profile == "dokbot":
+                fallback_prompt = get_fallback_prompt(request.profile)
+                if fallback_prompt:
+                    wrapped_messages = [
+                        {"role": "system", "content": fallback_prompt},
+                        {"role": "user", "content": f"Пользователь чата спрашивает: «{request.message}»\nСгенерируй ответ персонажа. Только JSON."},
+                    ]
+                    fallback_payload = Chat(messages=wrapped_messages, model=settings.GIGACHAT_MODEL)
+                    fallback_response = await client.achat(fallback_payload)
+
+                    if fallback_response.choices[0].finish_reason == "blacklist":
+                        return ChatResponse(response="", session_id=request.session_id, filtered=True)
+
+                    content = fallback_response.choices[0].message.content
+                    reply = parse_json_reply(content)
+                    return ChatResponse(response=reply, session_id=request.session_id)
+
             return ChatResponse(response="", session_id=request.session_id, filtered=True)
 
         content = response.choices[0].message.content
