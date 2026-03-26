@@ -2,6 +2,8 @@ import uvicorn
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from gigachat import GigaChat
+from openai import AsyncOpenAI
+
 
 from config import settings
 from routers import chat_router, models_router
@@ -10,6 +12,15 @@ from profiles import load_profiles
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_profiles()
+
+    if settings.GROK_API_KEY:
+        app.state.xai_client = AsyncOpenAI(
+            api_key=settings.GROK_API_KEY,
+            base_url="https://api.x.ai/v1",
+        )
+    else:
+        app.state.xai_client = None
+
     if settings.GIGACHAT_CREDENTIALS:
         async with GigaChat(credentials=settings.GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
             app.state.gigachat_client = client
