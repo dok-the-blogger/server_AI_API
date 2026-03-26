@@ -17,6 +17,7 @@ async def lifespan(app: FastAPI):
         app.state.xai_client = AsyncOpenAI(
             api_key=settings.GROK_API_KEY,
             base_url="https://api.x.ai/v1",
+            default_headers={"x-grok-conv-id": "51bae473-e626-4ac9-8765-82fcb3e3905c"},
         )
     else:
         app.state.xai_client = None

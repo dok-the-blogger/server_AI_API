@@ -3,9 +3,16 @@ from typing import Optional
 import json
 from fastapi import APIRouter, Header, HTTPException, Request
 from gigachat.models import Chat
+import logging
 
 from config import settings
-from profiles import get_system_prompt, get_fallback_prompt
+from profiles import (
+    get_system_prompt,
+    get_fallback_prompt,
+    get_grok_system_prompt,
+    get_grok_few_shot,
+    get_meta_system_prompt,
+)
 
 router = APIRouter()
 
@@ -88,16 +95,66 @@ async def chat(
 
             xai_client = getattr(request_obj.app.state, "xai_client", None)
             if xai_client is not None:
+                grok_sys_prompt = system_prompt
+                meta_sys_prompt = None
+
+                if request.profile:
+                    profile_grok_sys = get_grok_system_prompt(request.profile)
+                    if profile_grok_sys:
+                        grok_sys_prompt = profile_grok_sys
+
+                    meta_sys_prompt = get_meta_system_prompt(request.profile)
+
+                grok_messages = []
+                if grok_sys_prompt:
+                    grok_messages.append({"role": "system", "content": grok_sys_prompt})
+
+                if request.profile:
+                    few_shot_pairs = get_grok_few_shot(request.profile)
+                    for pair in few_shot_pairs:
+                        if "user" in pair and "assistant" in pair:
+                            grok_messages.append({"role": "user", "content": pair["user"]})
+                            grok_messages.append({"role": "assistant", "content": pair["assistant"]})
+
+                if request.context and "history" in request.context and isinstance(request.context["history"], list):
+                    grok_messages.extend(request.context["history"])
+
+                grok_messages.append({"role": "user", "content": request.message})
+
                 try:
                     grok_response = await xai_client.chat.completions.create(
                         model=settings.GROK_MODEL,
-                        messages=messages
+                        messages=grok_messages,
+                        max_tokens=settings.GROK_MAX_TOKENS
                     )
                     grok_content = grok_response.choices[0].message.content
+
+                    if not grok_content:
+                        raise ValueError("Empty response")
+
+                    logging.info(f"grok fallback: user={request.user_id} mode=direct")
                     return ChatResponse(response=grok_content, session_id=request.session_id, model="grok")
                 except Exception:
-                    # Ignore grok error and fallback to filtered=True
-                    pass
+                    if meta_sys_prompt:
+                        try:
+                            meta_messages = [
+                                {"role": "system", "content": meta_sys_prompt},
+                                {"role": "user", "content": request.message}
+                            ]
+                            meta_response = await xai_client.chat.completions.create(
+                                model=settings.GROK_MODEL,
+                                messages=meta_messages,
+                                max_tokens=settings.GROK_MAX_TOKENS
+                            )
+                            meta_content = meta_response.choices[0].message.content
+
+                            if not meta_content:
+                                raise ValueError("Empty response")
+
+                            logging.info(f"grok fallback: user={request.user_id} mode=meta")
+                            return ChatResponse(response=meta_content, session_id=request.session_id, model="grok")
+                        except Exception:
+                            pass
 
             return ChatResponse(response="", session_id=request.session_id, filtered=True)
 
