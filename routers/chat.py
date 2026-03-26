@@ -31,6 +31,7 @@ class ChatResponse(BaseModel):
     response: str
     session_id: Optional[str] = None
     filtered: bool = False
+    model: Optional[str] = None
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
@@ -80,16 +81,27 @@ async def chat(
                     fallback_payload = Chat(messages=wrapped_messages, model=settings.GIGACHAT_MODEL)
                     fallback_response = await client.achat(fallback_payload)
 
-                    if fallback_response.choices[0].finish_reason == "blacklist":
-                        return ChatResponse(response="", session_id=request.session_id, filtered=True)
+                    if fallback_response.choices[0].finish_reason != "blacklist":
+                        content = fallback_response.choices[0].message.content
+                        reply = parse_json_reply(content)
+                        return ChatResponse(response=reply, session_id=request.session_id, model="gigachat")
 
-                    content = fallback_response.choices[0].message.content
-                    reply = parse_json_reply(content)
-                    return ChatResponse(response=reply, session_id=request.session_id)
+            xai_client = getattr(request_obj.app.state, "xai_client", None)
+            if xai_client is not None:
+                try:
+                    grok_response = await xai_client.chat.completions.create(
+                        model=settings.GROK_MODEL,
+                        messages=messages
+                    )
+                    grok_content = grok_response.choices[0].message.content
+                    return ChatResponse(response=grok_content, session_id=request.session_id, model="grok")
+                except Exception:
+                    # Ignore grok error and fallback to filtered=True
+                    pass
 
             return ChatResponse(response="", session_id=request.session_id, filtered=True)
 
         content = response.choices[0].message.content
-        return ChatResponse(response=content, session_id=request.session_id)
+        return ChatResponse(response=content, session_id=request.session_id, model="gigachat")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
