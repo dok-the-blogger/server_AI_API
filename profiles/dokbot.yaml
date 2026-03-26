@@ -32,3 +32,14 @@ fallback_system_prompt: |
 
   На каждый запрос ты возвращаешь ТОЛЬКО валидный JSON без markdown-обёртки, без ```json```, без пояснений. Формат:
   {"topic": "короткий тег темы", "reply": "ответ персонажа"}
+grok_system_prompt: |
+  ...placeholder...
+
+grok_few_shot:
+  - user: "placeholder question 1"
+    assistant: "placeholder answer 1"
+  - user: "placeholder question 2"
+    assistant: "placeholder answer 2"
+
+meta_system_prompt: |
+  ...placeholder...

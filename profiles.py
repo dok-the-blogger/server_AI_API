@@ -34,3 +34,24 @@ def get_fallback_prompt(name: str) -> Optional[str]:
     if profile:
         return profile.get("fallback_system_prompt")
     return None
+
+def get_grok_system_prompt(name: str) -> Optional[str]:
+    """Получить системный промпт для Grok"""
+    profile = _profiles.get(name)
+    if profile:
+        return profile.get("grok_system_prompt") or profile.get("system_prompt")
+    return None
+
+def get_grok_few_shot(name: str) -> list[dict]:
+    """Получить few-shot примеры для Grok"""
+    profile = _profiles.get(name)
+    if profile:
+        return profile.get("grok_few_shot", [])
+    return []
+
+def get_meta_system_prompt(name: str) -> Optional[str]:
+    """Получить мета-промпт для Grok"""
+    profile = _profiles.get(name)
+    if profile:
+        return profile.get("meta_system_prompt")
+    return None

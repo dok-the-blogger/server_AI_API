@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     GIGACHAT_MODEL: str = "GigaChat-2"
     GROK_API_KEY: str = ""
     GROK_MODEL: str = "grok-4-1-fast-non-reasoning"
+    GROK_MAX_TOKENS: int = 256
     HOST: str = "127.0.0.1"
     PORT: int = 9000
     LOG_LEVEL: str = "info"
