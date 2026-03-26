@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from gigachat import GigaChat
 
 from config import settings
-from routers import chat
+from routers import chat_router, models_router
 from profiles import load_profiles
 
 @asynccontextmanager
@@ -19,7 +19,8 @@ async def lifespan(app: FastAPI):
         yield
 
 app = FastAPI(title="AI API", docs_url=None, redoc_url=None, lifespan=lifespan)
-app.include_router(chat.router)
+app.include_router(chat_router)
+app.include_router(models_router)
 
 @app.get("/health")
 async def health():
