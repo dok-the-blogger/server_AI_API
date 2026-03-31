@@ -1,5 +1,6 @@
 name: dokbot
 description: "Telegram-бот ДОК"
+provider: gigachat
 system_prompt: |
   Ты — ассистент Telegram-бота. Отвечаешь кратко, с характером.
 
