@@ -55,3 +55,10 @@ def get_meta_system_prompt(name: str) -> Optional[str]:
     if profile:
         return profile.get("meta_system_prompt")
     return None
+
+def get_provider(name: str) -> str:
+    """Получить провайдера профиля"""
+    profile = _profiles.get(name)
+    if profile:
+        return profile.get("provider", "gigachat")
+    return "gigachat"
