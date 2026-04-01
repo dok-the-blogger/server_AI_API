@@ -21,6 +21,13 @@ def get_profile(name: str) -> Optional[dict]:
     """Получить профиль по имени"""
     return _profiles.get(name)
 
+def get_user_template(name: str) -> Optional[str]:
+    """Получить шаблон пользователя из профиля"""
+    profile = _profiles.get(name)
+    if profile:
+        return profile.get("user_template")
+    return None
+
 def get_system_prompt(name: str) -> Optional[str]:
     """Получить системный промпт профиля"""
     profile = _profiles.get(name)

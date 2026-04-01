@@ -13,6 +13,7 @@ from profiles import (
     get_grok_few_shot,
     get_meta_system_prompt,
     get_provider,
+    get_user_template,
 )
 
 router = APIRouter()
@@ -53,7 +54,7 @@ async def _call_gigachat(request: ChatRequest, client, messages: list) -> ChatRe
     return ChatResponse(response=content, session_id=request.session_id, model="gigachat")
 
 
-async def _call_grok(request: ChatRequest, xai_client, system_prompt: Optional[str], fallback_mode: bool = False) -> ChatResponse:
+async def _call_grok(request: ChatRequest, xai_client, system_prompt: Optional[str], fallback_mode: bool = False, user_content: Optional[str] = None) -> ChatResponse:
     grok_sys_prompt = system_prompt
     meta_sys_prompt = None
 
@@ -78,7 +79,7 @@ async def _call_grok(request: ChatRequest, xai_client, system_prompt: Optional[s
     if request.context and "history" in request.context and isinstance(request.context["history"], list):
         grok_messages.extend(request.context["history"])
 
-    grok_messages.append({"role": "user", "content": request.message})
+    grok_messages.append({"role": "user", "content": user_content if user_content is not None else request.message})
 
     try:
         grok_response = await xai_client.chat.completions.create(
@@ -141,7 +142,7 @@ async def _handle_gigachat_fallback(request: ChatRequest, client, xai_client) ->
 
     if xai_client is not None:
         try:
-            return await _call_grok(request, xai_client, get_system_prompt(request.profile) if request.profile else None, fallback_mode=True)
+            return await _call_grok(request, xai_client, get_system_prompt(request.profile) if request.profile else None, fallback_mode=True, user_content=request.message)
         except Exception:
             pass
 
@@ -175,7 +176,13 @@ async def chat(
     if request.context and "history" in request.context and isinstance(request.context["history"], list):
         messages.extend(request.context["history"])
 
-    messages.append({"role": "user", "content": request.message})
+    user_content = request.message
+    if request.profile:
+        user_tpl = get_user_template(request.profile)
+        if user_tpl and "{message}" in user_tpl:
+            user_content = user_tpl.replace("{message}", request.message)
+
+    messages.append({"role": "user", "content": user_content})
 
     provider = get_provider(request.profile) if request.profile else "gigachat"
 
@@ -184,7 +191,7 @@ async def chat(
             xai_client = getattr(request_obj.app.state, "xai_client", None)
             if xai_client is None:
                 raise HTTPException(status_code=500, detail="Grok client is not initialized")
-            return await _call_grok(request, xai_client, system_prompt, fallback_mode=False)
+            return await _call_grok(request, xai_client, system_prompt, fallback_mode=False, user_content=user_content)
         else:
             client = getattr(request_obj.app.state, "gigachat_client", None)
             if client is None:
