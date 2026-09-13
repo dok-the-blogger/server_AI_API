@@ -6,8 +6,9 @@ from openai import AsyncOpenAI
 
 
 from config import settings
-from routers import chat_router, models_router
+from routers import chat_router, models_router, embeddings_router
 from profiles import load_profiles
+from embeddings import DigitalOceanEmbeddings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,17 +23,33 @@ async def lifespan(app: FastAPI):
     else:
         app.state.xai_client = None
 
-    if settings.GIGACHAT_CREDENTIALS:
-        async with GigaChat(credentials=settings.GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
-            app.state.gigachat_client = client
+    app.state.embeddings_client = (
+        DigitalOceanEmbeddings(
+            api_key=settings.DIGITALOCEAN_API_KEY,
+            base_url=settings.EMBEDDINGS_BASE_URL,
+            model=settings.EMBEDDINGS_MODEL,
+            dimensions=settings.EMBEDDINGS_DIMENSIONS,
+            timeout=settings.EMBEDDINGS_TIMEOUT_SECONDS,
+        )
+        if settings.DIGITALOCEAN_API_KEY else None
+    )
+
+    try:
+        if settings.GIGACHAT_CREDENTIALS:
+            async with GigaChat(credentials=settings.GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
+                app.state.gigachat_client = client
+                yield
+        else:
+            app.state.gigachat_client = None
             yield
-    else:
-        app.state.gigachat_client = None
-        yield
+    finally:
+        if app.state.embeddings_client is not None:
+            await app.state.embeddings_client.aclose()
 
 app = FastAPI(title="AI API", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.include_router(chat_router)
 app.include_router(models_router)
+app.include_router(embeddings_router)
 
 @app.get("/health")
 async def health():
