@@ -114,6 +114,11 @@ class DigitalOceanEmbeddings:
         except httpx.HTTPError:
             raise EmbeddingsError(502, "provider_unavailable", "Embeddings provider could not be reached") from None
 
+        if response.status_code == 402:
+            raise EmbeddingsError(
+                502, "provider_payment_required",
+                "DigitalOcean requires payment (HTTP 402). Check and top up the Serverless Inference prepayment balance.",
+            )
         if response.status_code == 429:
             raise EmbeddingsError(429, "provider_rate_limited", "Embeddings provider rate limit exceeded")
         if response.status_code in (400, 413, 422):

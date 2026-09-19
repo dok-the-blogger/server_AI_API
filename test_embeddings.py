@@ -144,6 +144,7 @@ def test_prepared_character_limits_and_batch_boundary(service):
     (400, 422, "provider_input_rejected"), (413, 422, "provider_input_rejected"),
     (422, 422, "provider_input_rejected"), (429, 429, "provider_rate_limited"),
     (401, 502, "provider_authentication_failed"), (403, 502, "provider_authentication_failed"),
+    (402, 502, "provider_payment_required"),
     (500, 502, "provider_error"), (404, 502, "provider_error"), (302, 502, "provider_error"),
 ])
 def test_provider_errors_no_retry_or_leak(service, status, expected, code):
@@ -169,6 +170,23 @@ def test_transport_errors(service, error, expected, code):
     assert response.json()["detail"]["code"] == code
     assert "provider-test-key" not in response.text
     assert len(state["requests"]) == 1
+
+
+def test_payment_required_explains_action_and_recovers(service):
+    client, state = service
+    state["reply"] = httpx.Response(402, json={"message": "provider-test-key private billing detail"})
+    response = client.post("/embeddings", headers=AUTH, json={"input": "текст"})
+    assert response.status_code == 502
+    assert response.json()["detail"] == {
+        "code": "provider_payment_required",
+        "message": "DigitalOcean requires payment (HTTP 402). Check and top up the Serverless Inference prepayment balance.",
+    }
+    state["reply"] = None
+    recovered = client.post("/embeddings", headers=AUTH, json={"input": "текст"})
+    assert recovered.status_code == 200
+    assert len(recovered.json()["data"][0]["embedding"]) == 1024
+    assert "detail" not in recovered.json()
+    assert len(state["requests"]) == 2
 
 
 def test_total_timeout(service):
