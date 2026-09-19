@@ -131,6 +131,7 @@ Preview; для serverless inference нужен положительный пр�
 | 429 | `provider_rate_limited` |
 | 503 | `embeddings_not_configured` |
 | 504 | `provider_timeout` |
+| 502 | `provider_payment_required`: DigitalOcean вернул HTTP 402; проверьте и пополните prepaid-баланс Serverless Inference |
 | 502 | `provider_unavailable`, `provider_authentication_failed`, `provider_error`, `invalid_provider_response` |
 
 Ошибки поставщика возвращаются в `detail.code` и `detail.message` без сырого
