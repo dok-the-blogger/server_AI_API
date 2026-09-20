@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from typing import Literal
 
@@ -9,6 +10,8 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from summary_presets import DOKNEWS_TLDR_V2, GENERIC_SUMMARY, OUTPUT_CONTRACT
+
+logger = logging.getLogger(__name__)
 
 SummaryModel = Literal["glm-5.3-flash", "deepseek-v4.1-flash"]
 SummaryPreset = Literal["doknews-tldr-v1", "doknews-tldr-v2"]
@@ -142,29 +145,40 @@ class DigitalOceanSummaries:
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
                         if len(body) > MAX_RESPONSE_BYTES:
+                            logger.warning("Summary provider response rejected: model=%s stage=response_size", model)
                             raise SummaryError(502, "invalid_provider_response", "Summary response is too large")
         except (TimeoutError, httpx.TimeoutException):
             raise SummaryError(504, "provider_timeout", "Summary provider timed out") from None
         except httpx.HTTPError:
             raise SummaryError(502, "provider_unavailable", "Summary provider could not be reached") from None
+        rejection_stage = "provider_json"
         try:
             result = json.loads(body)
+            rejection_stage = "response_envelope"
             if (not isinstance(result, dict) or result["model"] != model
                     or not isinstance(result["choices"], list) or len(result["choices"]) != 1):
                 raise ValueError
             choice = result["choices"][0]
+            rejection_stage = "choice"
             if not isinstance(choice, dict):
                 raise ValueError
+            rejection_stage = "output_limit" if choice.get("finish_reason") == "length" else "finish_reason"
+            if choice["finish_reason"] != "stop":
+                raise ValueError
+            rejection_stage = "message"
             message = choice["message"]
-            if (not isinstance(message, dict) or choice["finish_reason"] != "stop"
+            if (not isinstance(message, dict)
                     or message.get("role") != "assistant"
                     or message.get("tool_calls") or message.get("refusal")):
                 raise ValueError
+            rejection_stage = "summary_schema"
             summary = SummaryText.model_validate_json(message["content"])
+            rejection_stage = "usage"
             usage = SummaryUsage.model_validate(result["usage"])
             if usage.total_tokens != usage.prompt_tokens + usage.completion_tokens:
                 raise ValueError
         except (KeyError, TypeError, ValueError, RecursionError):
+            logger.warning("Summary provider response rejected: model=%s stage=%s", model, rejection_stage)
             raise SummaryError(502, "invalid_provider_response", "Summary provider returned an invalid result") from None
         return SummaryResponse(tldr=summary.tldr, model=model, usage=usage,
             prompt_version=article.preset or "summary-v1", preset=article.preset,
