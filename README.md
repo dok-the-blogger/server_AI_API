@@ -158,7 +158,10 @@ null — общая сводка. Отсутствующее поле сохра
 `prompt_hash` (SHA-256 фактической инструкции, включая дополнительную), `elapsed_ms`,
 `usage` (prompt/completion/total tokens). JSON содержит только валидированный результат.
 Provider timeout60s (max90), response64KiB, max_completion_tokens1024,
-reasoning_effort=none, без retry/fallback. Ключи/сырой provider error не раскрываются.
+reasoning_effort=none для GLM и low для DeepSeek, без retry/fallback.
+DigitalOcean отклоняет none для DeepSeek; low — минимальный поддерживаемый
+уровень. Уровень выбирается по фактической модели запроса, включая SUMMARIES_MODEL.
+Ключи/сырой provider error не раскрываются.
 Авторизация прежним AI_API_API_TOKEN; ключ DigitalOcean остаётся в этом сервисе.
 
 AI API не сохраняет сводки и не обновляет статьи. Хранение принадлежит doknews:

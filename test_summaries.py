@@ -35,6 +35,8 @@ def service(monkeypatch):
             raise state["error"]
         if state["delay"]:
             await asyncio.sleep(state["delay"])
+        if callable(state["reply"]):
+            return state["reply"](request)
         return state["reply"] if state["reply"] is not None else httpx.Response(200, json=provider_result())
 
     original = httpx.AsyncClient
@@ -117,6 +119,42 @@ def test_general_summary_without_article_title_or_preset(service):
     assert response.json()["prompt_version"] == "summary-v1"
     assert response.json()["preset"] is None
     assert len(state["requests"]) == 1
+
+
+@pytest.mark.parametrize("default_model,requested_model,selected_model,effort", [
+    ("glm-5.3-flash", "deepseek-v4.1-flash", "deepseek-v4.1-flash", "low"),
+    ("deepseek-v4.1-flash", None, "deepseek-v4.1-flash", "low"),
+    ("deepseek-v4.1-flash", "glm-5.3-flash", "glm-5.3-flash", "none"),
+    ("glm-5.3-flash", None, "glm-5.3-flash", "none"),
+])
+def test_provider_reasoning_contract_for_effective_model(
+        service, default_model, requested_model, selected_model, effort):
+    client, state = service
+    state["provider"].model = default_model
+
+    def provider_reply(request):
+        sent = json.loads(request.content)
+        # Reproduce DigitalOcean's observed rejection, including its allowed levels.
+        if sent["model"] == "deepseek-v4.1-flash" and sent["reasoning_effort"] not in {
+                "low", "high", "xhigh", "max"}:
+            return httpx.Response(400, json={"error": {
+                "message": "reasoning_effort must be one of [low high xhigh max] for this model"}})
+        reply = provider_result()
+        reply["model"] = selected_model
+        return httpx.Response(200, json=reply)
+
+    state["reply"] = provider_reply
+    response = client.post("/summaries", headers=AUTH, json={
+        **ARTICLE, "model": requested_model, "preset": "doknews-tldr-v2"})
+    assert response.status_code == 200
+    assert response.json()["model"] == selected_model
+    assert len(state["requests"]) == 1
+    sent = json.loads(state["requests"][0].content)
+    assert sent["reasoning_effort"] == effort
+    assert sent["response_format"] == {"type": "json_object"}
+    assert sent["max_completion_tokens"] == 1024
+    assert sent["stream"] is False
+    assert json.loads(sent["messages"][1]["content"]) == ARTICLE
 
 
 @pytest.mark.parametrize("status,code", [(402, "provider_payment_required"), (429, "provider_rate_limited"),
