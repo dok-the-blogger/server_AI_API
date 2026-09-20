@@ -141,46 +141,32 @@ Preview; для serverless inference нужен положительный пр�
 
 ### POST /summaries
 
-Краткая русская справка об уже опубликованной новости. Метод принимает
-`title`, `body_text`, `body_format` и необязательную `publication_date` (строка
-или `null`), возвращает `tldr`, `provider`, `model`, `prompt_version` и
-`usage` с `prompt_tokens`, `completion_tokens`, `total_tokens`.
+Разовая короткая сводка через DigitalOcean. Обязателен `body_text` (1–131072
+символа); `title` (до4096), `body_format` (до80, default plain-text) и
+`publication_date` (до64) необязательны. Поля исходника — данные, не инструкции.
+`model`: `glm-5.3-flash` либо `deepseek-v4.1-flash`; без поля используется
+SUMMARIES_MODEL (по умолчанию GLM). Нет автоматической подмены модели.
 
-Вход передаётся целиком; пределы: заголовок 4096 символов, тело 131072,
-формат 80, дата 64. Неизвестные поля, неверные типы, пустой текст и невалидный
-Unicode отклоняются до обращения к модели. Клиент не задаёт модель,
-инструкцию или URL поставщика.
+`preset`: `doknews-tldr-v2` — новая инструкция архива; `doknews-tldr-v1` — прежняя;
+null — общая сводка. Отсутствующее поле сохраняет v1 для совместимости при
+поэтапной выкладке. Новый worker doknews и MCP явно выбирают preset.
+`instruction` (1–8000 символов) дополняет preset либо уточняет общую сводку.
+Требования JSON и предела 900 символов сохраняются. Инструкция v2 хранится
+в summary_presets.py; другие сервисы передают её имя, а не копию текста.
 
-Используется тот же `AI_API_DIGITALOCEAN_API_KEY`, что для эмбеддингов.
-Без него метод возвращает 503 `summaries_not_configured`.
+Ответ: `tldr`, `provider`, фактическая `model`, `preset`, `prompt_version`,
+`prompt_hash` (SHA-256 фактической инструкции, включая дополнительную), `elapsed_ms`,
+`usage` (prompt/completion/total tokens). JSON содержит только валидированный результат.
+Provider timeout60s (max90), response64KiB, max_completion_tokens1024,
+reasoning_effort=none, без retry/fallback. Ключи/сырой provider error не раскрываются.
+Авторизация прежним AI_API_API_TOKEN; ключ DigitalOcean остаётся в этом сервисе.
 
-| Настройка | Значение по умолчанию |
-| --- | --- |
-| `AI_API_SUMMARIES_BASE_URL` | `https://inference.do-ai.run/v1` |
-| `AI_API_SUMMARIES_MODEL` | `glm-5.3-flash` |
-| `AI_API_SUMMARIES_TIMEOUT_SECONDS` | `60`; общий таймаут, максимум 90 секунд |
-
-Chat Completions запрашивается с JSON-ответом, `reasoning_effort=none`,
-`max_completion_tokens=1024`. Версия инструкции — `doknews-tldr-v1`.
-Обычно справка занимает 1–3 предложения и 200–500 символов, жёсткий предел —
-900 символов. Сохраняются стадия события, числа, условия и оговорки; внешние
-знания и инструкции из текста статьи использовать нельзя. Фактическая точность
-проверяется отдельной выборкой; проверка формата сама по себе её не гарантирует.
-
-Проверяются модель, единственный завершённый ответ `finish_reason=stop`,
-JSON ровно с полем `tldr`, отсутствие вызовов инструментов/отказа и корректный
-usage. Ответ поставщика ограничен 64 KiB; сырой ответ в ошибку не попадает.
-Ошибка контракта — 502 `invalid_provider_response`. Остальные безопасные коды
-совпадают с эмбеддингами; HTTP 400/413/422 поставщика дают
-`provider_input_rejected`. Автоматического повтора или смены модели нет.
-
-AI API не хранит статьи и справки. Очередью, актуальностью и повторными попытками
-владеет потребитель `doknews`. При смене модели/инструкции нужно согласованно
-обновлять его профиль. `test_summaries.py` проверяет роутер и HTTP-транспорт без
-платных запросов. Контракт Chat Completions и reasoning сверены с
-[документацией DigitalOcean](https://docs.digitalocean.com/products/inference/how-to/use-chat-completions-api/)
-и [параметрами reasoning](https://docs.digitalocean.com/products/inference/how-to/use-reasoning/)
-20 сентября 2026.
+AI API не сохраняет сводки и не обновляет статьи. Хранение принадлежит doknews:
+смена инструкции не требует массового пересчёта прежних готовых результатов.
+Тесты используют настоящий router и имитацию HTTP поставщика, без платных запросов.
+[Контракт DigitalOcean](https://docs.digitalocean.com/products/inference/how-to/use-chat-completions-api/)
+и [каталог моделей](https://docs.digitalocean.com/products/inference/details/models/)
+проверены 20 сентября 2026.
 
 ### POST /chat
 Принимает JSON:
