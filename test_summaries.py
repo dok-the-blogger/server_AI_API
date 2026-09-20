@@ -68,7 +68,8 @@ def test_real_router_provider_contract_and_provenance(service):
 
 @pytest.mark.parametrize("change", [{"body_text": " "}, {"body_text": "x" * (MAX_BODY_CHARS + 1)},
     {"title": 5}, {"model": "expensive"}, {"body_text": "\ud800"}, {"prompt": "override"},
-    {"preset": "unknown"}, {"instruction": " "}, {"instruction": "x" * 8001}])
+    {"preset": "unknown"}, {"instruction": " "}, {"instruction": "x" * 8001},
+    {"max_completion_tokens": 99999}])
 def test_invalid_inputs_never_call_provider(service, change):
     client, state = service
     response = client.post("/summaries", headers={**AUTH, "Content-Type": "application/json"},
@@ -152,7 +153,7 @@ def test_provider_reasoning_contract_for_effective_model(
     sent = json.loads(state["requests"][0].content)
     assert sent["reasoning_effort"] == effort
     assert sent["response_format"] == {"type": "json_object"}
-    assert sent["max_completion_tokens"] == 1024
+    assert sent["max_completion_tokens"] == (2048 if selected_model == "deepseek-v4.1-flash" else 1024)
     assert sent["stream"] is False
     assert json.loads(sent["messages"][1]["content"]) == ARTICLE
 
@@ -171,7 +172,7 @@ def test_provider_failures_are_safe_and_not_retried(service, status, code):
     assert len(state["requests"]) == 1
 
 
-@pytest.mark.parametrize("invalid", ["length", "blank", "fields", "model", "usage", "tool", "refusal", "json", "huge", "message_type", "choices_type", "root_type"])
+@pytest.mark.parametrize("invalid", ["length", "blank", "fields", "model", "usage", "tool", "refusal", "json", "huge", "long_tldr", "message_type", "choices_type", "root_type"])
 def test_invalid_model_output_never_becomes_summary(service, invalid, caplog):
     client, state = service
     payload = provider_result()
@@ -185,6 +186,7 @@ def test_invalid_model_output_never_becomes_summary(service, invalid, caplog):
     elif invalid == "refusal": choice["message"]["refusal"] = "refused"
     elif invalid == "json": choice["message"]["content"] = "not JSON"
     elif invalid == "huge": choice["message"]["content"] = "x" * MAX_RESPONSE_BYTES
+    elif invalid == "long_tldr": choice["message"]["content"] = json.dumps({"tldr": "x" * 901})
     elif invalid == "message_type": choice["message"] = []
     elif invalid == "choices_type": payload["choices"] = {"0": choice}
     elif invalid == "root_type": payload = []
@@ -195,6 +197,8 @@ def test_invalid_model_output_never_becomes_summary(service, invalid, caplog):
     assert "Summary provider response rejected: model=glm-5.3-flash stage=" in caplog.text
     if invalid == "length":
         assert "stage=output_limit" in caplog.text
+    if invalid == "long_tldr":
+        assert "stage=summary_schema validation_type=string_too_long" in caplog.text
     assert str(choice.get("message")) not in caplog.text
 
 

@@ -157,13 +157,15 @@ null — общая сводка. Отсутствующее поле сохра
 Ответ: `tldr`, `provider`, фактическая `model`, `preset`, `prompt_version`,
 `prompt_hash` (SHA-256 фактической инструкции, включая дополнительную), `elapsed_ms`,
 `usage` (prompt/completion/total tokens). JSON содержит только валидированный результат.
-Provider timeout60s (max90), response64KiB, max_completion_tokens1024,
+Provider timeout60s (max90), response64KiB,
+max_completion_tokens=1024 для GLM и 2048 для DeepSeek (включая рассуждение),
 reasoning_effort=none для GLM и low для DeepSeek, без retry/fallback.
 DigitalOcean отклоняет none для DeepSeek; low — минимальный поддерживаемый
 уровень. Уровень выбирается по фактической модели запроса, включая SUMMARIES_MODEL.
 Ключи/сырой provider error не раскрываются.
 Если ответ не проходит валидацию, журнал фиксирует только выбранную модель и
-статический этап отказа (например, output_limit); исходник и ответ модели не пишутся.
+статический этап отказа (например, output_limit) и разрешённый тип ошибки схемы;
+исходник и ответ модели не пишутся. Предел tldr остаётся 900 символов.
 Авторизация прежним AI_API_API_TOKEN; ключ DigitalOcean остаётся в этом сервисе.
 
 AI API не сохраняет сводки и не обновляет статьи. Хранение принадлежит doknews:

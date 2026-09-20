@@ -7,7 +7,7 @@ import time
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from summary_presets import DOKNEWS_TLDR_V2, GENERIC_SUMMARY, OUTPUT_CONTRACT
 
@@ -134,7 +134,8 @@ class DigitalOceanSummaries:
             "response_format": {"type": "json_object"},
             # DigitalOcean rejects "none" for DeepSeek; use its lowest supported level.
             "reasoning_effort": "low" if model == "deepseek-v4.1-flash" else "none",
-            "max_completion_tokens": 1024,
+            # Reasoning consumes the DeepSeek output budget before the final summary.
+            "max_completion_tokens": 2048 if model == "deepseek-v4.1-flash" else 1024,
             "stream": False,
         }
         try:
@@ -177,8 +178,16 @@ class DigitalOceanSummaries:
             usage = SummaryUsage.model_validate(result["usage"])
             if usage.total_tokens != usage.prompt_tokens + usage.completion_tokens:
                 raise ValueError
-        except (KeyError, TypeError, ValueError, RecursionError):
-            logger.warning("Summary provider response rejected: model=%s stage=%s", model, rejection_stage)
+        except (KeyError, TypeError, ValueError, RecursionError) as error:
+            validation_type = "not_applicable"
+            if isinstance(error, ValidationError):
+                error_type = error.errors(include_input=False, include_context=False, include_url=False)[0]["type"]
+                validation_type = error_type if error_type in {
+                    "json_invalid", "model_type", "string_type", "string_too_short", "string_too_long",
+                    "extra_forbidden", "missing", "value_error", "int_type", "greater_than_equal",
+                } else "other"
+            logger.warning("Summary provider response rejected: model=%s stage=%s validation_type=%s",
+                           model, rejection_stage, validation_type)
             raise SummaryError(502, "invalid_provider_response", "Summary provider returned an invalid result") from None
         return SummaryResponse(tldr=summary.tldr, model=model, usage=usage,
             prompt_version=article.preset or "summary-v1", preset=article.preset,
