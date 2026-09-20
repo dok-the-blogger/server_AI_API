@@ -1,7 +1,7 @@
 # AI API
 
-API для сервисов: текстовые ответы через GigaChat/Grok и текстовые эмбеддинги
-Qwen3 Embedding 0.6B через DigitalOcean Inference. Python 3.11+.
+API для сервисов: текстовые ответы через GigaChat/Grok, эмбеддинги Qwen3
+Embedding 0.6B и краткие справки о новостях через DigitalOcean Inference. Python 3.11+.
 
 ## Запуск
 
@@ -13,7 +13,7 @@ Qwen3 Embedding 0.6B через DigitalOcean Inference. Python 3.11+.
     python main.py
 
 По умолчанию приложение слушает `127.0.0.1:9000`. При непустом `AI_API_API_TOKEN`
-методы `/chat`, `/models` и `/embeddings` требуют заголовок
+методы `/chat`, `/models`, `/embeddings` и `/summaries` требуют заголовок
 `Authorization: Bearer <этот токен>`. `/health` открыт.
 
 Для эмбеддингов заполнить `AI_API_DIGITALOCEAN_API_KEY` ключом доступа к моделям
@@ -138,6 +138,49 @@ Preview; для serverless inference нужен положительный пр�
 ответа, ключей или исходного текста. Автоматических повторов, переключения модели
 и частичного успеха нет. Таймаут не доказывает отсутствие тарификации у
 поставщика; повтором управляет вызывающий сервис.
+
+### POST /summaries
+
+Краткая русская справка об уже опубликованной новости. Метод принимает
+`title`, `body_text`, `body_format` и необязательную `publication_date` (строка
+или `null`), возвращает `tldr`, `provider`, `model`, `prompt_version` и
+`usage` с `prompt_tokens`, `completion_tokens`, `total_tokens`.
+
+Вход передаётся целиком; пределы: заголовок 4096 символов, тело 131072,
+формат 80, дата 64. Неизвестные поля, неверные типы, пустой текст и невалидный
+Unicode отклоняются до обращения к модели. Клиент не задаёт модель,
+инструкцию или URL поставщика.
+
+Используется тот же `AI_API_DIGITALOCEAN_API_KEY`, что для эмбеддингов.
+Без него метод возвращает 503 `summaries_not_configured`.
+
+| Настройка | Значение по умолчанию |
+| --- | --- |
+| `AI_API_SUMMARIES_BASE_URL` | `https://inference.do-ai.run/v1` |
+| `AI_API_SUMMARIES_MODEL` | `glm-5.3-flash` |
+| `AI_API_SUMMARIES_TIMEOUT_SECONDS` | `60`; общий таймаут, максимум 90 секунд |
+
+Chat Completions запрашивается с JSON-ответом, `reasoning_effort=none`,
+`max_completion_tokens=1024`. Версия инструкции — `doknews-tldr-v1`.
+Обычно справка занимает 1–3 предложения и 200–500 символов, жёсткий предел —
+900 символов. Сохраняются стадия события, числа, условия и оговорки; внешние
+знания и инструкции из текста статьи использовать нельзя. Фактическая точность
+проверяется отдельной выборкой; проверка формата сама по себе её не гарантирует.
+
+Проверяются модель, единственный завершённый ответ `finish_reason=stop`,
+JSON ровно с полем `tldr`, отсутствие вызовов инструментов/отказа и корректный
+usage. Ответ поставщика ограничен 64 KiB; сырой ответ в ошибку не попадает.
+Ошибка контракта — 502 `invalid_provider_response`. Остальные безопасные коды
+совпадают с эмбеддингами; HTTP 400/413/422 поставщика дают
+`provider_input_rejected`. Автоматического повтора или смены модели нет.
+
+AI API не хранит статьи и справки. Очередью, актуальностью и повторными попытками
+владеет потребитель `doknews`. При смене модели/инструкции нужно согласованно
+обновлять его профиль. `test_summaries.py` проверяет роутер и HTTP-транспорт без
+платных запросов. Контракт Chat Completions и reasoning сверены с
+[документацией DigitalOcean](https://docs.digitalocean.com/products/inference/how-to/use-chat-completions-api/)
+и [параметрами reasoning](https://docs.digitalocean.com/products/inference/how-to/use-reasoning/)
+20 сентября 2026.
 
 ### POST /chat
 Принимает JSON:
