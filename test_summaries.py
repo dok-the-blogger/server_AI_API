@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 
 import httpx
@@ -64,7 +65,8 @@ def test_real_router_provider_contract_and_provenance(service):
 
 
 @pytest.mark.parametrize("change", [{"body_text": " "}, {"body_text": "x" * (MAX_BODY_CHARS + 1)},
-    {"title": 5}, {"model": "expensive"}, {"body_text": "\ud800"}, {"prompt": "override"}])
+    {"title": 5}, {"model": "expensive"}, {"body_text": "\ud800"}, {"prompt": "override"},
+    {"preset": "unknown"}, {"instruction": " "}, {"instruction": "x" * 8001}])
 def test_invalid_inputs_never_call_provider(service, change):
     client, state = service
     response = client.post("/summaries", headers={**AUTH, "Content-Type": "application/json"},
@@ -86,6 +88,35 @@ def test_auth_and_unconfigured_provider(service):
         assert response.json()["detail"]["code"] == "summaries_not_configured"
     finally:
         main.app.state.summaries_client = provider
+
+
+@pytest.mark.parametrize("model", ["glm-5.3-flash", "deepseek-v4.1-flash"])
+def test_selected_model_preset_and_additive_instruction_cross_real_router(service, model):
+    client, state = service
+    reply = provider_result(); reply["model"] = model
+    state["reply"] = httpx.Response(200, json=reply)
+    request = {**ARTICLE, "model": model, "preset": "doknews-tldr-v2", "instruction": "Сохрани новую дату."}
+    response = client.post("/summaries", headers=AUTH, json=request)
+    assert response.status_code == 200
+    result = response.json()
+    sent = json.loads(state["requests"][0].content)
+    assert sent["model"] == result["model"] == model
+    assert result["prompt_version"] == result["preset"] == "doknews-tldr-v2"
+    assert result["prompt_hash"] == hashlib.sha256(sent["messages"][0]["content"].encode()).hexdigest()
+    assert result["elapsed_ms"] >= 0
+    assert "Сохрани новую дату." in sent["messages"][0]["content"]
+    assert json.loads(sent["messages"][1]["content"]) == ARTICLE
+    assert len(state["requests"]) == 1
+
+
+def test_general_summary_without_article_title_or_preset(service):
+    client, state = service
+    response = client.post("/summaries", headers=AUTH, json={
+        "body_text": "Произвольный текст", "preset": None, "instruction": "Одно предложение."})
+    assert response.status_code == 200
+    assert response.json()["prompt_version"] == "summary-v1"
+    assert response.json()["preset"] is None
+    assert len(state["requests"]) == 1
 
 
 @pytest.mark.parametrize("status,code", [(402, "provider_payment_required"), (429, "provider_rate_limited"),

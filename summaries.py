@@ -1,10 +1,17 @@
 """Bounded, stateless news summaries through DigitalOcean Chat Completions."""
 import asyncio
+import hashlib
 import json
+import time
 from typing import Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from summary_presets import DOKNEWS_TLDR_V2, GENERIC_SUMMARY, OUTPUT_CONTRACT
+
+SummaryModel = Literal["glm-5.3-flash", "deepseek-v4.1-flash"]
+SummaryPreset = Literal["doknews-tldr-v1", "doknews-tldr-v2"]
 
 PROMPT_VERSION = "doknews-tldr-v1"
 MAX_BODY_CHARS = 131072
@@ -29,12 +36,16 @@ tldr: русский связный текст, обычно 1–3 предло�
 
 class SummaryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    title: str = Field(min_length=1, max_length=4096)
+    title: str | None = Field(default=None, min_length=1, max_length=4096)
     body_text: str = Field(min_length=1, max_length=MAX_BODY_CHARS)
-    body_format: str = Field(min_length=1, max_length=80)
+    body_format: str = Field(default="plain-text", min_length=1, max_length=80)
     publication_date: str | None = Field(default=None, max_length=64)
+    model: SummaryModel | None = None
+    # Preserve the deployed v1 worker during a rolling upgrade. New callers select v2.
+    preset: SummaryPreset | None = "doknews-tldr-v1"
+    instruction: str | None = Field(default=None, min_length=1, max_length=8000)
 
-    @field_validator("title", "body_text", "body_format", "publication_date")
+    @field_validator("title", "body_text", "body_format", "publication_date", "instruction")
     @classmethod
     def valid_text(cls, value):
         if value is not None:
@@ -45,6 +56,15 @@ class SummaryRequest(BaseModel):
             except UnicodeEncodeError:
                 raise ValueError("Text must be valid Unicode") from None
         return value
+
+    def system_prompt(self) -> str:
+        prompt = {"doknews-tldr-v1": SYSTEM_PROMPT, "doknews-tldr-v2": DOKNEWS_TLDR_V2,
+                  None: GENERIC_SUMMARY}[self.preset]
+        if self.preset != "doknews-tldr-v1" or self.instruction is not None:
+            prompt = OUTPUT_CONTRACT + "\n\n" + prompt
+        if self.instruction is not None:
+            prompt += "\n\nДополнительная инструкция:\n" + self.instruction
+        return prompt
 
 
 class SummaryUsage(BaseModel):
@@ -71,7 +91,10 @@ class SummaryText(BaseModel):
 class SummaryResponse(SummaryText):
     provider: Literal["digitalocean"] = "digitalocean"
     model: str = Field(min_length=1, max_length=128)
-    prompt_version: Literal["doknews-tldr-v1"] = PROMPT_VERSION
+    prompt_version: Literal["doknews-tldr-v1", "doknews-tldr-v2", "summary-v1"] = PROMPT_VERSION
+    preset: SummaryPreset | None = "doknews-tldr-v1"
+    prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    elapsed_ms: int = Field(ge=0)
     usage: SummaryUsage
 
 
@@ -82,23 +105,29 @@ class SummaryError(Exception):
 
 
 class DigitalOceanSummaries:
-    """No retries, fallback model, storage or client-controlled prompts/URLs."""
+    """Bounded stateless inference with allowlisted models and versioned instructions."""
     def __init__(self, *, api_key, base_url, model, timeout):
         self.model, self.timeout = model, timeout
         self.http = httpx.AsyncClient(
             base_url=base_url.rstrip("/") + "/",
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=timeout, follow_redirects=False,
+            timeout=timeout, follow_redirects=False, trust_env=False,
         )
 
     async def aclose(self):
         await self.http.aclose()
 
     async def summarize(self, article: SummaryRequest) -> SummaryResponse:
+        started = time.monotonic()
+        model = article.model or self.model
+        if model not in {"glm-5.3-flash", "deepseek-v4.1-flash"}:
+            raise SummaryError(503, "summaries_not_configured", "Summary model is not configured")
+        prompt = article.system_prompt()
         payload = {
-            "model": self.model,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": json.dumps(article.model_dump(), ensure_ascii=False)}],
+            "model": model,
+            "messages": [{"role": "system", "content": prompt},
+                         {"role": "user", "content": json.dumps(article.model_dump(
+                             include={"title", "body_text", "body_format", "publication_date"}), ensure_ascii=False)}],
             "response_format": {"type": "json_object"},
             "reasoning_effort": "none",
             "max_completion_tokens": 1024,
@@ -119,7 +148,7 @@ class DigitalOceanSummaries:
             raise SummaryError(502, "provider_unavailable", "Summary provider could not be reached") from None
         try:
             result = json.loads(body)
-            if (not isinstance(result, dict) or result["model"] != self.model
+            if (not isinstance(result, dict) or result["model"] != model
                     or not isinstance(result["choices"], list) or len(result["choices"]) != 1):
                 raise ValueError
             choice = result["choices"][0]
@@ -136,7 +165,10 @@ class DigitalOceanSummaries:
                 raise ValueError
         except (KeyError, TypeError, ValueError, RecursionError):
             raise SummaryError(502, "invalid_provider_response", "Summary provider returned an invalid result") from None
-        return SummaryResponse(tldr=summary.tldr, model=self.model, usage=usage)
+        return SummaryResponse(tldr=summary.tldr, model=model, usage=usage,
+            prompt_version=article.preset or "summary-v1", preset=article.preset,
+            prompt_hash=hashlib.sha256(prompt.encode()).hexdigest(),
+            elapsed_ms=round((time.monotonic() - started) * 1000))
 
     @staticmethod
     def _check_status(status):
