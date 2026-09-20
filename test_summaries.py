@@ -1,0 +1,137 @@
+import asyncio
+import json
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+import main
+from config import settings
+from summaries import MAX_BODY_CHARS, MAX_RESPONSE_BYTES
+
+AUTH = {"Authorization": "Bearer client-test-token"}
+ARTICLE = {"title": "Запуск перенесён", "body_text": "Компания обещала запуск 1 июня, но перенесла его на июль. Новая дата не подтверждена.",
+           "body_format": "doknews-markup-v1", "publication_date": "2026-06-01"}
+
+
+def provider_result():
+    return {"model": "glm-5.3-flash", "choices": [{"finish_reason": "stop", "message": {
+        "role": "assistant", "content": json.dumps({"tldr": "Компания перенесла запуск с 1 июня на июль; новая дата не подтверждена."})}}],
+        "usage": {"prompt_tokens": 150, "completion_tokens": 40, "total_tokens": 190}}
+
+
+@pytest.fixture
+def service(monkeypatch):
+    for name, value in {"API_TOKEN": "client-test-token", "DIGITALOCEAN_API_KEY": "provider-test-key",
+                        "GROK_API_KEY": "", "GIGACHAT_CREDENTIALS": "",
+                        "SUMMARIES_MODEL": "glm-5.3-flash"}.items():
+        monkeypatch.setattr(settings, name, value)
+    state = {"requests": [], "reply": None, "error": None, "delay": 0}
+
+    async def respond(request):
+        state["requests"].append(request)
+        if state["error"]:
+            raise state["error"]
+        if state["delay"]:
+            await asyncio.sleep(state["delay"])
+        return state["reply"] if state["reply"] is not None else httpx.Response(200, json=provider_result())
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: original(*a, transport=httpx.MockTransport(respond), **kw))
+    with TestClient(main.app) as client:
+        state["provider"] = main.app.state.summaries_client
+        yield client, state
+
+
+def test_real_router_provider_contract_and_provenance(service):
+    client, state = service
+    response = client.post("/summaries", headers=AUTH, json=ARTICLE)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["tldr"] == "Компания перенесла запуск с 1 июня на июль; новая дата не подтверждена."
+    assert (result["model"], result["provider"], result["prompt_version"]) == (
+        "glm-5.3-flash", "digitalocean", "doknews-tldr-v1")
+    assert result["usage"]["total_tokens"] == 190
+    assert len(state["requests"]) == 1
+    sent = state["requests"][0]
+    payload = json.loads(sent.content)
+    assert str(sent.url) == "https://inference.do-ai.run/v1/chat/completions"
+    assert sent.headers["authorization"] == "Bearer provider-test-key"
+    assert json.loads(payload["messages"][1]["content"]) == ARTICLE
+    assert payload["messages"][0]["role"] == "system"
+    assert payload["max_completion_tokens"] == 1024
+    assert payload["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize("change", [{"body_text": " "}, {"body_text": "x" * (MAX_BODY_CHARS + 1)},
+    {"title": 5}, {"model": "expensive"}, {"body_text": "\ud800"}, {"prompt": "override"}])
+def test_invalid_inputs_never_call_provider(service, change):
+    client, state = service
+    response = client.post("/summaries", headers={**AUTH, "Content-Type": "application/json"},
+                           content=json.dumps({**ARTICLE, **change}))
+    assert response.status_code == 422
+    assert state["requests"] == []
+    assert "input" not in response.json()["detail"][0]
+
+
+def test_auth_and_unconfigured_provider(service):
+    client, state = service
+    assert client.post("/summaries", json=ARTICLE).status_code == 401
+    assert state["requests"] == []
+    provider = main.app.state.summaries_client
+    main.app.state.summaries_client = None
+    try:
+        response = client.post("/summaries", headers=AUTH, json=ARTICLE)
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "summaries_not_configured"
+    finally:
+        main.app.state.summaries_client = provider
+
+
+@pytest.mark.parametrize("status,code", [(402, "provider_payment_required"), (429, "provider_rate_limited"),
+    (401, "provider_authentication_failed"), (400, "provider_input_rejected"),
+    (503, "provider_error"), (302, "provider_error")])
+def test_provider_failures_are_safe_and_not_retried(service, status, code):
+    client, state = service
+    state["reply"] = httpx.Response(status, json={"error": "provider-test-key private text"},
+                                    headers={"Location": "https://other.example/"})
+    response = client.post("/summaries", headers=AUTH, json=ARTICLE)
+    assert response.json()["detail"]["code"] == code
+    assert "provider-test-key" not in response.text
+    assert "private text" not in response.text
+    assert len(state["requests"]) == 1
+
+
+@pytest.mark.parametrize("invalid", ["length", "blank", "fields", "model", "usage", "tool", "refusal", "json", "huge", "message_type", "choices_type", "root_type"])
+def test_invalid_model_output_never_becomes_summary(service, invalid):
+    client, state = service
+    payload = provider_result()
+    choice = payload["choices"][0]
+    if invalid == "length": choice["finish_reason"] = "length"
+    elif invalid == "blank": choice["message"]["content"] = '{"tldr":"  "}'
+    elif invalid == "fields": choice["message"]["content"] = '{"tldr":"ok","extra":"bad"}'
+    elif invalid == "model": payload["model"] = "another-model"
+    elif invalid == "usage": payload["usage"]["total_tokens"] = 0
+    elif invalid == "tool": choice["message"]["tool_calls"] = [{"name": "call"}]
+    elif invalid == "refusal": choice["message"]["refusal"] = "refused"
+    elif invalid == "json": choice["message"]["content"] = "not JSON"
+    elif invalid == "huge": choice["message"]["content"] = "x" * MAX_RESPONSE_BYTES
+    elif invalid == "message_type": choice["message"] = []
+    elif invalid == "choices_type": payload["choices"] = {"0": choice}
+    elif invalid == "root_type": payload = []
+    state["reply"] = httpx.Response(200, json=payload)
+    response = client.post("/summaries", headers=AUTH, json=ARTICLE)
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "invalid_provider_response"
+
+
+def test_total_timeout_and_transport(service):
+    client, state = service
+    state["provider"].timeout = 0.01
+    state["delay"] = 0.1
+    assert client.post("/summaries", headers=AUTH, json=ARTICLE).status_code == 504
+    state["delay"] = 0
+    state["error"] = httpx.ConnectError("private")
+    response = client.post("/summaries", headers=AUTH, json=ARTICLE)
+    assert response.json()["detail"]["code"] == "provider_unavailable"
+    assert len(state["requests"]) == 2

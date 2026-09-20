@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     EMBEDDINGS_MODEL: str = "qwen3-embedding-0.6b"
     EMBEDDINGS_DIMENSIONS: int = Field(default=1024, gt=0)
     EMBEDDINGS_TIMEOUT_SECONDS: float = Field(default=30.0, gt=0, le=300)
+    SUMMARIES_BASE_URL: str = "https://inference.do-ai.run/v1"
+    SUMMARIES_MODEL: str = "glm-5.3-flash"
+    SUMMARIES_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=90)
     HOST: str = "127.0.0.1"
     PORT: int = 9000
     LOG_LEVEL: str = "info"
