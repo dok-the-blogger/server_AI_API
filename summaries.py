@@ -129,7 +129,8 @@ class DigitalOceanSummaries:
                          {"role": "user", "content": json.dumps(article.model_dump(
                              include={"title", "body_text", "body_format", "publication_date"}), ensure_ascii=False)}],
             "response_format": {"type": "json_object"},
-            "reasoning_effort": "none",
+            # DigitalOcean rejects "none" for DeepSeek; use its lowest supported level.
+            "reasoning_effort": "low" if model == "deepseek-v4.1-flash" else "none",
             "max_completion_tokens": 1024,
             "stream": False,
         }
