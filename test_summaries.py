@@ -172,7 +172,7 @@ def test_provider_failures_are_safe_and_not_retried(service, status, code):
 
 
 @pytest.mark.parametrize("invalid", ["length", "blank", "fields", "model", "usage", "tool", "refusal", "json", "huge", "message_type", "choices_type", "root_type"])
-def test_invalid_model_output_never_becomes_summary(service, invalid):
+def test_invalid_model_output_never_becomes_summary(service, invalid, caplog):
     client, state = service
     payload = provider_result()
     choice = payload["choices"][0]
@@ -192,6 +192,10 @@ def test_invalid_model_output_never_becomes_summary(service, invalid):
     response = client.post("/summaries", headers=AUTH, json=ARTICLE)
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "invalid_provider_response"
+    assert "Summary provider response rejected: model=glm-5.3-flash stage=" in caplog.text
+    if invalid == "length":
+        assert "stage=output_limit" in caplog.text
+    assert str(choice.get("message")) not in caplog.text
 
 
 def test_total_timeout_and_transport(service):
