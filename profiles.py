@@ -69,3 +69,9 @@ def get_provider(name: str) -> str:
     if profile:
         return profile.get("provider", "gigachat")
     return "gigachat"
+
+
+def get_model(name: str) -> Optional[str]:
+    """Optional model selection for a MiMo profile."""
+    profile = _profiles.get(name)
+    return profile.get("model") if profile else None

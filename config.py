@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
+from completion_providers import MimoChatModel
 
 class Settings(BaseSettings):
     API_TOKEN: str = ""        # Bearer-токен для авторизации
@@ -9,6 +10,11 @@ class Settings(BaseSettings):
     GROK_API_KEY: str = ""
     GROK_MODEL: str = "grok-4-1-fast-non-reasoning"
     GROK_MAX_TOKENS: int = 256
+    MIMO_API_KEY: str = ""
+    MIMO_BASE_URL: str = "https://api.xiaomimimo.com/v1"
+    MIMO_MODEL: MimoChatModel = "mimo-v2.6-flash"
+    MIMO_MAX_TOKENS: int = Field(default=1024, gt=0, le=131072)
+    MIMO_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=90)
     DIGITALOCEAN_API_KEY: str = ""
     EMBEDDINGS_BASE_URL: str = "https://inference.do-ai.run/v1"
     EMBEDDINGS_MODEL: str = "qwen3-embedding-0.6b"

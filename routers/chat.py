@@ -6,6 +6,7 @@ from gigachat.models import Chat
 import logging
 
 from config import settings
+from completion_providers import MODEL_PROFILES, CompletionError, MimoChatModel
 from profiles import (
     get_system_prompt,
     get_fallback_prompt,
@@ -13,6 +14,7 @@ from profiles import (
     get_grok_few_shot,
     get_meta_system_prompt,
     get_provider,
+    get_model,
     get_user_template,
 )
 
@@ -31,6 +33,7 @@ def parse_json_reply(text: str) -> str:
 
 class ChatRequest(BaseModel):
     message: str
+    model: Optional[MimoChatModel] = None
     user_id: Optional[int] = None
     profile: Optional[str] = None
     session_id: Optional[str] = None
@@ -41,6 +44,41 @@ class ChatResponse(BaseModel):
     session_id: Optional[str] = None
     filtered: bool = False
     model: Optional[str] = None
+
+
+async def _call_mimo(request: ChatRequest, client, messages: list) -> ChatResponse:
+    model = request.model or (get_model(request.profile) if request.profile else None) or settings.MIMO_MODEL
+    profile = MODEL_PROFILES.get(model)
+    if profile is None or profile.provider != "mimo":
+        raise CompletionError(503, "chat_not_configured", "MiMo chat model is not configured")
+    payload = {**profile.parameters(settings.MIMO_MAX_TOKENS), "messages": messages}
+    try:
+        body = await client.complete(payload, timeout=settings.MIMO_TIMEOUT_SECONDS)
+    except CompletionError as error:
+        if error.code == "provider_content_filtered":
+            return ChatResponse(response="", session_id=request.session_id, filtered=True, model=model)
+        raise
+    try:
+        data = json.loads(body)
+        if (not isinstance(data, dict) or data["model"] != model
+                or not isinstance(data["choices"], list) or len(data["choices"]) != 1):
+            raise ValueError
+        choice = data["choices"][0]
+        if not isinstance(choice, dict):
+            raise ValueError
+        if choice.get("finish_reason") == "content_filter":
+            return ChatResponse(response="", session_id=request.session_id, filtered=True, model=model)
+        message = choice["message"]
+        if (choice["finish_reason"] not in {"stop", "length"}
+                or not isinstance(message, dict) or message.get("role") != "assistant"
+                or message.get("tool_calls") or message.get("refusal")
+                or not isinstance(message.get("content"), str) or not message["content"].strip()):
+            raise ValueError
+        message["content"].encode("utf-8")
+        return ChatResponse(response=message["content"], session_id=request.session_id, model=model)
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise CompletionError(502, "invalid_provider_response",
+                              "MiMo returned an invalid chat response") from None
 
 
 async def _call_gigachat(request: ChatRequest, client, messages: list) -> ChatResponse:
@@ -184,10 +222,16 @@ async def chat(
 
     messages.append({"role": "user", "content": user_content})
 
-    provider = get_provider(request.profile) if request.profile else "gigachat"
+    provider = "mimo" if request.model is not None else (
+        get_provider(request.profile) if request.profile else "gigachat")
 
     try:
-        if provider == "grok":
+        if provider == "mimo":
+            mimo_client = getattr(request_obj.app.state, "mimo_client", None)
+            if mimo_client is None:
+                raise CompletionError(503, "chat_not_configured", "MiMo provider is not configured")
+            return await _call_mimo(request, mimo_client, messages)
+        elif provider == "grok":
             xai_client = getattr(request_obj.app.state, "xai_client", None)
             if xai_client is None:
                 raise HTTPException(status_code=500, detail="Grok client is not initialized")
@@ -202,6 +246,9 @@ async def chat(
                 xai_client = getattr(request_obj.app.state, "xai_client", None)
                 return await _handle_gigachat_fallback(request, client, xai_client)
             return result
+    except CompletionError as error:
+        raise HTTPException(status_code=error.status_code,
+                            detail={"code": error.code, "message": error.message}) from None
     except HTTPException:
         raise
     except Exception as e:
