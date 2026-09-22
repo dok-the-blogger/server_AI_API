@@ -1,7 +1,7 @@
 # AI API
 
-API для сервисов: текстовые ответы через GigaChat/Grok, эмбеддинги Qwen3
-Embedding 0.6B и краткие справки о новостях через DigitalOcean Inference. Python 3.11+.
+API для сервисов: текстовые ответы через GigaChat/Grok/Xiaomi MiMo, эмбеддинги Qwen3
+Embedding 0.6B через DigitalOcean и краткие сводки через DigitalOcean или MiMo. Python 3.11+.
 
 ## Запуск
 
@@ -33,6 +33,32 @@ DigitalOcean. Это ключ поставщика, отдельный от кл
 `EMBEDDINGS_DIMENSIONS` проверяет ответ, но не просит поставщика сократить вектор.
 Подготовка текста в этой версии предназначена для Qwen3. Смена модели или
 подготовки требует проверки совместимости и обычно пересчёта сохранённых векторов.
+
+### Xiaomi MiMo
+
+Для MiMo заполнить **отдельный** `AI_API_MIMO_API_KEY` в приватном окружении сервиса
+и перезапустить приложение. Ключ не нужен для запуска остальных провайдеров.
+Не заменяйте `AI_API_SUMMARIES_BASE_URL` адресом MiMo: этот параметр принадлежит
+DigitalOcean и используется только с ключом DigitalOcean. Адреса и ключи задаёт
+оператор; клиент выбирает только разрешённое имя модели.
+
+| Настройка | Значение по умолчанию |
+| --- | --- |
+| `AI_API_MIMO_API_KEY` | Пусто; вызовы MiMo возвращают 503 |
+| `AI_API_MIMO_BASE_URL` | `https://api.xiaomimimo.com/v1` |
+| `AI_API_MIMO_MODEL` | `mimo-v2.6-flash`; для chat-профилей `provider: mimo` |
+| `AI_API_MIMO_MAX_TOKENS` | `1024`; бюджет ответа `/chat` |
+| `AI_API_MIMO_TIMEOUT_SECONDS` | `60`, максимум 90; общий таймаут `/chat` |
+
+Сводки MiMo используют прежний `AI_API_SUMMARIES_TIMEOUT_SECONDS` и бюджет 1024.
+У обеих моделей MiMo явно задано `thinking.type=disabled`; параметры рассуждения
+DigitalOcean не передаются. Общий транспорт ограничивает ответ 64 KiB, запрещает
+redirects и не выполняет retry/fallback. Ключи, сырые ошибки и reasoning не выдаются.
+Профили моделей и общий транспорт находятся в `completion_providers.py`; проверка
+схемы сводки остаётся общей для всех провайдеров в `summaries.py`.
+
+Добавление MiMo не меняет `AI_API_SUMMARIES_MODEL=glm-5.3-flash`, существующие chat-профили
+или фоновую генерацию TL;DR в doknews. Установка только ключа MiMo не переключает defaults.
 
 ## Проверка
 
@@ -141,10 +167,11 @@ Preview; для serverless inference нужен положительный пр�
 
 ### POST /summaries
 
-Разовая короткая сводка через DigitalOcean. Обязателен `body_text` (1–131072
+Разовая короткая сводка через DigitalOcean или Xiaomi MiMo. Обязателен `body_text` (1–131072
 символа); `title` (до4096), `body_format` (до80, default plain-text) и
 `publication_date` (до64) необязательны. Поля исходника — данные, не инструкции.
-`model`: `glm-5.3-flash` либо `deepseek-v4.1-flash`; без поля используется
+`model`: `glm-5.3-flash`, `deepseek-v4.1-flash` (DigitalOcean) либо
+`mimo-v2.6-flash` (MiMo); `mimo-v2.6-pro` для summary не разрешена. Без поля используется
 SUMMARIES_MODEL (по умолчанию GLM). Нет автоматической подмены модели.
 
 `preset`: `doknews-tldr-v2` — новая инструкция архива; `doknews-tldr-v1` — прежняя;
@@ -166,7 +193,17 @@ DigitalOcean отклоняет none для DeepSeek; low — минимальн
 Если ответ не проходит валидацию, журнал фиксирует только выбранную модель и
 статический этап отказа (например, output_limit) и разрешённый тип ошибки схемы;
 исходник и ответ модели не пишутся. Предел tldr остаётся 900 символов.
-Авторизация прежним AI_API_API_TOKEN; ключ DigitalOcean остаётся в этом сервисе.
+Авторизация прежним AI_API_API_TOKEN; оба ключа поставщиков остаются в этом сервисе.
+`provider` равен `digitalocean` или `mimo` согласно выбранной модели. Без её ключа
+возвращается 503 `summaries_not_configured`, без перехода к другому провайдеру.
+Для MiMo различаются `provider_payment_required` (402 поставщика),
+`provider_access_denied` (403: регион/ограничение ключа) и `provider_content_filtered` (421).
+
+Пример явного выбора без изменения настроек сайта:
+
+```json
+{"body_text":"Текст для сводки…","model":"mimo-v2.6-flash","preset":null}
+```
 
 AI API не сохраняет сводки и не обновляет статьи. Хранение принадлежит doknews:
 смена инструкции не требует массового пересчёта прежних готовых результатов.
@@ -178,24 +215,47 @@ AI API не сохраняет сводки и не обновляет стат�
 ### POST /chat
 Принимает JSON:
 - `message` (str, обязательно) — текст сообщения
+- `model` (str, опционально) — `mimo-v2.6-flash` или `mimo-v2.6-pro`
 - `user_id` (int, опционально) — ID пользователя
 - `profile` (str, опционально) — пресет сервиса
 - `session_id` (str, опционально) — ID сессии для продолжения диалога
 - `context` (dict, опционально) — доп. данные от сервиса
 
+Явный `model` выбирает MiMo, сохраняя системный текст, user template и историю
+выбранного профиля. Без `model` действует прежний `provider` профиля (без профиля —
+GigaChat). Для нового YAML-профиля можно указать `provider: mimo` и необязательный
+`model`; при отсутствии модели используется `AI_API_MIMO_MODEL`. Порядок выбора:
+модель запроса → модель MiMo-профиля → настройка MiMo. Прежние few-shot и fallback
+Grok остаются только в пути Grok. `session_id` возвращается клиенту; история
+по-прежнему передаётся в `context.history`, сервер её не хранит.
+
+```json
+{"message":"Объясни эту идею","model":"mimo-v2.6-pro","session_id":"example"}
+```
+
 Возвращает JSON:
 - `response` (str) — ответ
 - `session_id` (str | null) — ID сессии
 - `filtered` (bool) — ответ отфильтрован
-- `model` (str | null) — использованный поставщик
+- `model` (str | null) — точное имя MiMo; для прежних клиентов сохраняются gigachat/grok
+
+Фильтрация MiMo (HTTP 421 либо finish_reason=content_filter) возвращает прежнюю
+форму `filtered=true` с пустым ответом. Остальные ошибки нормализованы в `detail.code`
+и безопасное сообщение. Ответ с finish_reason=length допустим для chat; сводки
+по-прежнему принимаются только после полного завершения и проверки JSON.
 
 ### GET /models
 
 Возвращает список моделей GigaChat и выбранную модель GigaChat. Не является
 каталогом моделей DigitalOcean.
+`GET /models?provider=mimo` возвращает две разрешённые модели MiMo и её текущую
+модель для chat-профилей, без платного запроса поставщику. Требует сервисный token;
+без настроенного ключа MiMo возвращает 503. Это локальный каталог, не live health.
 
 ## Источники контракта
 
+- [MiMo Chat Completions API](https://mimo.mi.com/docs/en-US/api/chat/openai-api)
+- [MiMo Error Codes](https://mimo.mi.com/docs/en-US/api/guidance/error-codes) — сверены 22.09.2026
 - [DigitalOcean Embeddings API](https://docs.digitalocean.com/reference/api/reference/embeddings/)
 - [Каталог DigitalOcean](https://docs.digitalocean.com/products/inference/details/models/)
 - [Подготовка запросов Qwen3](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)

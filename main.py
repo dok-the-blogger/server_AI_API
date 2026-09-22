@@ -9,7 +9,8 @@ from config import settings
 from routers import chat_router, models_router, embeddings_router, summaries_router
 from profiles import load_profiles
 from embeddings import DigitalOceanEmbeddings
-from summaries import DigitalOceanSummaries
+from summaries import Summaries
+from completion_providers import ChatCompletionsProvider
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,13 +37,19 @@ async def lifespan(app: FastAPI):
     )
 
     try:
-        app.state.summaries_client = (
-            DigitalOceanSummaries(
-                api_key=settings.DIGITALOCEAN_API_KEY,
-                base_url=settings.SUMMARIES_BASE_URL,
-                model=settings.SUMMARIES_MODEL,
-                timeout=settings.SUMMARIES_TIMEOUT_SECONDS,
-            ) if settings.DIGITALOCEAN_API_KEY else None
+        providers = {}
+        if settings.DIGITALOCEAN_API_KEY:
+            providers["digitalocean"] = ChatCompletionsProvider(
+                provider="digitalocean", api_key=settings.DIGITALOCEAN_API_KEY,
+                base_url=settings.SUMMARIES_BASE_URL)
+        if settings.MIMO_API_KEY:
+            providers["mimo"] = ChatCompletionsProvider(
+                provider="mimo", api_key=settings.MIMO_API_KEY,
+                base_url=settings.MIMO_BASE_URL)
+        app.state.mimo_client = providers.get("mimo")
+        app.state.summaries_client = Summaries(
+            providers=providers, model=settings.SUMMARIES_MODEL,
+            timeout=settings.SUMMARIES_TIMEOUT_SECONDS,
         )
         if settings.GIGACHAT_CREDENTIALS:
             async with GigaChat(credentials=settings.GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
