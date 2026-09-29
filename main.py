@@ -11,6 +11,8 @@ from profiles import load_profiles
 from embeddings import DigitalOceanEmbeddings
 from summaries import Summaries
 from completion_providers import ChatCompletionsProvider
+from classification import JevClassifier
+from routers.classification import router as classification_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -37,6 +39,12 @@ async def lifespan(app: FastAPI):
     )
 
     try:
+        app.state.jev_client = (
+            JevClassifier(api_key=settings.DIGITALOCEAN_API_KEY,
+                          base_url=settings.JEV_BASE_URL, model=settings.JEV_MODEL,
+                          timeout=settings.JEV_TIMEOUT_SECONDS)
+            if settings.DIGITALOCEAN_API_KEY else None
+        )
         providers = {}
         if settings.DIGITALOCEAN_API_KEY:
             providers["digitalocean"] = ChatCompletionsProvider(
@@ -59,6 +67,8 @@ async def lifespan(app: FastAPI):
             app.state.gigachat_client = None
             yield
     finally:
+        if getattr(app.state, "jev_client", None) is not None:
+            await app.state.jev_client.aclose()
         if app.state.embeddings_client is not None:
             await app.state.embeddings_client.aclose()
         if getattr(app.state, "summaries_client", None) is not None:
@@ -69,6 +79,7 @@ app.include_router(chat_router)
 app.include_router(models_router)
 app.include_router(embeddings_router)
 app.include_router(summaries_router)
+app.include_router(classification_router)
 
 @app.get("/health")
 async def health():

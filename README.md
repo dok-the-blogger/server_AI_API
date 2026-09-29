@@ -264,3 +264,26 @@ Grok остаются только в пути Grok. `session_id` возвращ
 Документация сверена 13 сентября 2026. Тариф $0.04 за миллион токенов опубликован
 в разделе Knowledge Bases; применимость к отдельному API нужно подтвердить в
 биллинге. Приложение возвращает токены без неподтверждённой денежной оценки.
+# Классификация намерений Докбота через Jev
+
+POST `/classify/dokbot`, тело `{"text":"Покажи новости про ИИ"}` (1–4096
+символов). Авторизация прежним `AI_API_API_TOKEN`, если он установлен.
+Jev использует существующий `AI_API_DIGITALOCEAN_API_KEY` и отдельный
+`/v1/systemone`, не Chat Completions. Значения по умолчанию:
+`AI_API_JEV_BASE_URL=https://inference.do-ai.run/v1`,
+`AI_API_JEV_MODEL=typesafe-jev-1.13.0`, `AI_API_JEV_TIMEOUT_SECONDS=8`.
+
+Ответ: `intent=news|login|assistant`, `news_mode=latest|search`, `confidence`,
+`model`, `provider`, `prompt_version=dokbot-intents-v1`, `usage` с
+`input_tokens/output_tokens`. Режим новостей — параметр маршрута, а не четвёртое
+намерение. Оба решения получаются за один запрос с общим контекстом.
+
+Нет ключа: 503 `classification_not_configured`. Таймаут: 504. Ошибка поставщика:
+502, включая отдельные коды оплаты/доступа; rate limit: 429. Автоповторов и
+подмены генеративной моделью нет; исходные тексты и тела ошибок не журналируются.
+Модель/три намерения задаёт сервис; вызывающий код не может подменить промпт.
+Тесты: `python -m pytest -q test_classification.py` (контракт на HTTP-макете,
+не доказательство точности живой модели). Код совместим с прежними зависимостями.
+
+Контракт поставщика:
+https://docs.digitalocean.com/products/inference/how-to/use-system-one-api/

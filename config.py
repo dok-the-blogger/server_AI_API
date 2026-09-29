@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     MIMO_MAX_TOKENS: int = Field(default=1024, gt=0, le=131072)
     MIMO_TIMEOUT_SECONDS: float = Field(default=60.0, gt=0, le=90)
     DIGITALOCEAN_API_KEY: str = ""
+    JEV_BASE_URL: str = "https://inference.do-ai.run/v1"
+    JEV_MODEL: str = "typesafe-jev-1.13.0"
+    JEV_TIMEOUT_SECONDS: float = Field(default=8.0, gt=0, le=30)
     EMBEDDINGS_BASE_URL: str = "https://inference.do-ai.run/v1"
     EMBEDDINGS_MODEL: str = "qwen3-embedding-0.6b"
     EMBEDDINGS_DIMENSIONS: int = Field(default=1024, gt=0)
