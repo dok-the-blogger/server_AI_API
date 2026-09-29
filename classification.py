@@ -1,9 +1,13 @@
-"""Three DokBot intents through DigitalOcean's non-generative System One API."""
+"""Shared Jev transport for typed decisions and the fixed DokBot intent profile."""
 import asyncio
+import json
+import time
 from typing import Annotated, Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from systemone_models import SystemOneRequest, SystemOneResponse
 
 Intent = Literal["news", "login", "assistant"]
 NewsMode = Literal["latest", "search"]
@@ -55,14 +59,6 @@ class ClassificationRequest(BaseModel):
         return value
 
 
-class ChoiceAnswer(BaseModel):
-    model_config = ConfigDict(strict=True)
-    type: Literal["choice"]
-    choice: str
-    probabilities: dict[str, Probability]
-    confidence: Probability
-
-
 class ClassificationUsage(BaseModel):
     model_config = ConfigDict(strict=True)
     input_tokens: int = Field(ge=0)
@@ -97,38 +93,48 @@ class JevClassifier:
         await self.http.aclose()
 
     async def classify(self, text: str) -> ClassificationResponse:
+        result = await self.decide(SystemOneRequest(
+            model=self.model, state={"message": text}, questions=QUESTIONS,
+        ))
+        return ClassificationResponse(
+            intent=result.answers["intent"].choice,
+            news_mode=result.answers["news_mode"].choice,
+            confidence=result.answers["intent"].confidence,
+            model=result.model,
+            usage=ClassificationUsage.model_validate(result.usage.model_dump()),
+        )
+
+    async def decide(self, request: SystemOneRequest) -> SystemOneResponse:
+        started = time.monotonic()
+        if request.model != self.model:
+            raise ClassificationError(503, "classification_not_configured", "Jev model is not configured")
         try:
             async with asyncio.timeout(self.timeout):
-                response = await self.http.post("systemone", json={
-                    "model": self.model, "state": {"message": text}, "questions": QUESTIONS,
-                })
+                async with self.http.stream("POST", "systemone", json=request.model_dump()) as response:
+                    status = response.status_code
+                    if status != 200:
+                        code = {402: "provider_payment_required", 429: "provider_rate_limited",
+                                401: "provider_authentication_failed", 403: "provider_access_denied",
+                                400: "provider_input_rejected", 422: "provider_input_rejected"}.get(
+                                    status, "provider_error")
+                        raise ClassificationError(429 if status == 429 else 502,
+                                                  code, "DigitalOcean rejected the Jev request")
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > 262144:
+                            raise ClassificationError(502, "invalid_provider_response", "Jev response is too large")
         except (TimeoutError, httpx.TimeoutException):
             raise ClassificationError(504, "provider_timeout", "Jev timed out") from None
         except httpx.HTTPError:
             raise ClassificationError(502, "provider_unavailable", "Jev could not be reached") from None
-        if response.status_code != 200:
-            code = {402: "provider_payment_required", 429: "provider_rate_limited",
-                    401: "provider_authentication_failed", 403: "provider_access_denied"}.get(
-                        response.status_code, "provider_error")
-            raise ClassificationError(429 if response.status_code == 429 else 502,
-                                      code, "DigitalOcean rejected the Jev request")
         try:
-            data = response.json()
-            if data["model"] != self.model:
-                raise ValueError("Unexpected model")
-            answers = {}
-            for name, question in QUESTIONS.items():
-                answer = ChoiceAnswer.model_validate(data["answers"][name])
-                allowed = set(question["criteria"])
-                if answer.choice not in allowed or set(answer.probabilities) != allowed:
-                    raise ValueError("Unexpected choice")
-                if abs(sum(answer.probabilities.values()) - 1) > 0.01:
-                    raise ValueError("Invalid probability distribution")
-                answers[name] = answer
-            return ClassificationResponse(
-                intent=answers["intent"].choice, news_mode=answers["news_mode"].choice,
-                confidence=answers["intent"].confidence, model=self.model,
-                usage=ClassificationUsage.model_validate(data["usage"]),
-            )
-        except (ValueError, TypeError, KeyError):
+            data = json.loads(body)
+            result = SystemOneResponse.model_validate({
+                **data, "provider": "digitalocean",
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+            })
+            result.validate_for(request)
+            return result
+        except (ValueError, TypeError, KeyError, RecursionError):
             raise ClassificationError(502, "invalid_provider_response", "Jev returned an invalid result") from None

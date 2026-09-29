@@ -5,8 +5,25 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from classification import ClassificationError, ClassificationRequest, ClassificationResponse
 from config import settings
 from routers.embeddings import EmbeddingsRoute
+from systemone_models import SystemOneRequest, SystemOneResponse
 
 router = APIRouter(route_class=EmbeddingsRoute)
+
+
+@router.post("/systemone", response_model=SystemOneResponse)
+async def systemone(request_obj: Request, request: SystemOneRequest,
+                    authorization: Optional[str] = Header(None)):
+    if settings.API_TOKEN and authorization != f"Bearer {settings.API_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    client = getattr(request_obj.app.state, "jev_client", None)
+    if client is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "classification_not_configured", "message": "Jev is not configured"})
+    try:
+        return await client.decide(request)
+    except ClassificationError as error:
+        raise HTTPException(status_code=error.status_code,
+                            detail={"code": error.code, "message": error.message}) from None
 
 
 @router.post("/classify/dokbot", response_model=ClassificationResponse)
