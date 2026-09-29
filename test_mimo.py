@@ -222,3 +222,84 @@ def test_mimo_chat_timeout_transport_and_auth(service, monkeypatch):
     result = client.post("/chat", headers=AUTH, json=body)
     assert result.json()["detail"]["code"] == "provider_unavailable"
     assert "private input" not in result.text
+
+
+@pytest.mark.parametrize("model", [FLASH, PRO, "glm-5.3-flash", "deepseek-v4.1-flash"])
+@pytest.mark.parametrize("reason", ["stop", "length"])
+def test_generate_long_text_format_budget_and_provenance(service, model, reason):
+    client, state = service
+    text = "# Обзор\n\n" + "Длинный текст. " * 150 + "\n\n- Итог\n"
+    state["reply"] = {"model": model, "choices": [{"finish_reason": reason, "message": {
+        "role": "assistant", "content": text}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 800, "total_tokens": 810}}
+    response = client.post("/generate", headers=AUTH, json={
+        "input": "Исходные материалы", "instruction": "Напиши обзор.",
+        "model": model, "max_output_tokens": 8192})
+    assert response.status_code == 200
+    result = response.json()
+    assert result["text"] == text and len(text) > 900
+    assert result["truncated"] == (reason == "length")
+    assert result["finish_reason"] == reason
+    sent = state["requests"][0]
+    payload = json.loads(sent.content)
+    assert payload["max_completion_tokens"] == 8192
+    assert "response_format" not in payload
+    assert payload["messages"] == [{"role": "system", "content": "Напиши обзор."},
+                                   {"role": "user", "content": "Исходные материалы"}]
+    assert sent.headers["authorization"] == ("Bearer mimo-only-secret" if model.startswith("mimo") else "Bearer do-only-secret")
+    assert len(state["requests"]) == 1
+
+
+@pytest.mark.parametrize("change", [
+    {"input": " "}, {"instruction": ""}, {"instruction": "x" * 16001},
+    {"input": "x" * 131073}, {"input": "я" * 131072}, {"input": "\ud800"},
+    {"model": "other"}, {"max_output_tokens": True}, {"max_output_tokens": 63},
+    {"max_output_tokens": 8193}, {"preset": "doknews-tldr-v2"},
+])
+def test_generate_invalid_requests_before_provider(service, change):
+    client, state = service
+    response = client.post("/generate", headers={**AUTH, "Content-Type": "application/json"},
+        content=json.dumps({"input": "Private input", "instruction": "Do task", **change}))
+    assert response.status_code == 422
+    assert "Private input" not in response.text
+    assert not state["requests"]
+
+
+def test_generate_auth_defaults_and_missing_provider(service, monkeypatch):
+    client, state = service
+    request = {"input": "Text", "instruction": "Respond"}
+    assert client.post("/generate", json=request).status_code == 401
+    assert not state["requests"]
+    result = client.post("/generate", headers=AUTH, json=request)
+    assert result.status_code == 200 and result.json()["model"] == FLASH
+    assert json.loads(state["requests"][0].content)["max_completion_tokens"] == 2048
+    with monkeypatch.context() as patch:
+        patch.delitem(main.app.state.summaries_client.providers, "mimo")
+        result = client.post("/generate", headers=AUTH, json=request)
+        assert result.status_code == 503
+        assert result.json()["detail"]["code"] == "generation_not_configured"
+    assert len(state["requests"]) == 1
+
+
+@pytest.mark.parametrize("defect", ["model", "reason", "tools", "empty", "usage", "oversized"])
+def test_generate_rejects_invalid_provider_answers(service, defect):
+    client, state = service
+    reply = {"model": FLASH, "choices": [{"finish_reason": "stop", "message": {
+        "role": "assistant", "content": "Private output"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+    if defect == "model":
+        reply["model"] = PRO
+    elif defect == "reason":
+        reply["choices"][0]["finish_reason"] = "tool_calls"
+    elif defect == "tools":
+        reply["choices"][0]["message"]["tool_calls"] = [{"private": "tool"}]
+    elif defect == "empty":
+        reply["choices"][0]["message"]["content"] = " "
+    elif defect == "usage":
+        reply["usage"]["total_tokens"] = 99
+    else:
+        reply["choices"][0]["message"]["content"] = "x" * 262145
+    state["reply"] = reply
+    result = client.post("/generate", headers=AUTH, json={"input": "Text", "instruction": "Task"})
+    assert result.status_code == 502 and "Private" not in result.text
+    assert len(state["requests"]) == 1

@@ -1,3 +1,4 @@
+from routers.generation import router as generation_router
 import uvicorn
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
@@ -79,6 +80,7 @@ app.include_router(chat_router)
 app.include_router(models_router)
 app.include_router(embeddings_router)
 app.include_router(summaries_router)
+app.include_router(generation_router)
 app.include_router(classification_router)
 
 @app.get("/health")
