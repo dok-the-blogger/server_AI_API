@@ -123,3 +123,67 @@ def test_timeout_and_missing_provider(service):
         assert response.status_code == 503
     finally:
         main.app.state.jev_client = provider
+
+
+def generic_request():
+    return {"state": {"message": "Покажи новости"}, "questions": {
+        "route": {"type": "choice", "instructions": "Что хочет автор?",
+                  "criteria": {"news": "Новости", "chat": "Общение"}},
+        "importance": {"type": "score", "instructions": "Оцени важность",
+                       "criteria": ["низкая", "высокая"]},
+        "specific": {"type": "noul", "instructions": "Указана тема?"},
+    }}
+
+
+def generic_response():
+    return {"model": MODEL, "answers": {
+        "route": {"type": "choice", "choice": "news", "confidence": 0.8,
+                  "probabilities": {"news": 0.9, "chat": 0.1}},
+        "importance": {"type": "score", "score": 0.3, "confidence": 0.6,
+                       "legend": {"0": "низкая", "1": "высокая"},
+                       "probabilities": {"0": 0.7, "1": 0.3}},
+        "specific": {"type": "noul", "noul": 0.05},
+    }, "usage": {"input_tokens": 123, "output_tokens": 45}}
+
+
+def test_generic_systemone_all_types_auth_and_single_provider_call(service, monkeypatch):
+    client, state = service
+    state["result"] = generic_response()
+    assert client.post("/systemone", json=generic_request()).status_code == 401
+    assert not state["requests"]
+    response = client.post("/systemone", headers=AUTH, json=generic_request())
+    assert response.status_code == 200
+    result = response.json()
+    assert result.pop("provider") == "digitalocean"
+    assert result.pop("elapsed_ms") >= 0
+    assert result == generic_response()
+    assert len(state["requests"]) == 1
+    assert json.loads(state["requests"][0].content) == {"model": MODEL, **generic_request()}
+    monkeypatch.setattr(settings, "API_TOKEN", "")
+    assert client.post("/systemone", json=generic_request()).status_code == 200
+
+
+@pytest.mark.parametrize("change", [{"state": " "}, {"state": {"x": "\ud800"}},
+    {"state": "я" * 33000}, {"model": "other"}, {"questions": {}}, {"url": "https://example.com"}])
+def test_invalid_generic_input_no_provider(service, change):
+    client, state = service
+    response = client.post("/systemone", headers={**AUTH, "Content-Type": "application/json"},
+                           content=json.dumps({**generic_request(), **change}))
+    assert response.status_code == 422
+    assert not state["requests"]
+
+
+@pytest.mark.parametrize("defect", ["missing", "scale", "type", "nan", "oversized"])
+def test_generic_provider_contract_errors(service, defect):
+    client, state = service
+    data = generic_response()
+    if defect == "missing": del data["answers"]["specific"]
+    if defect == "scale": data["answers"]["importance"]["legend"]["1"] = "other"
+    if defect == "type": data["answers"]["specific"] = data["answers"]["route"]
+    if defect == "nan": data["answers"]["specific"]["noul"] = "NaN"
+    if defect == "oversized": data["padding"] = "X" * 262145
+    state["result"] = data
+    response = client.post("/systemone", headers=AUTH, json=generic_request())
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "invalid_provider_response"
+    assert len(state["requests"]) == 1

@@ -13,7 +13,8 @@ Embedding 0.6B через DigitalOcean и краткие сводки через
     python main.py
 
 По умолчанию приложение слушает `127.0.0.1:9000`. При непустом `AI_API_API_TOKEN`
-методы `/chat`, `/models`, `/embeddings` и `/summaries` требуют заголовок
+методы `/chat`, `/models`, `/embeddings`, `/summaries`, `/classify/dokbot` и `/systemone`
+требуют заголовок
 `Authorization: Bearer <этот токен>`. `/health` открыт.
 
 Для эмбеддингов заполнить `AI_API_DIGITALOCEAN_API_KEY` ключом доступа к моделям
@@ -287,3 +288,23 @@ Jev использует существующий `AI_API_DIGITALOCEAN_API_KEY` 
 
 Контракт поставщика:
 https://docs.digitalocean.com/products/inference/how-to/use-system-one-api/
+# Типизированные решения Jev для агентов
+
+`POST /systemone` принимает `model="typesafe-jev-1.13.0"` (default), `state`
+(текст, JSON-объект или список текстов) и `questions` (1–16 именованных вопросов).
+Каждый вопрос: `type`, `instructions` (1–4096 символов); `choice` требует `criteria`
+как объект из 2–32 вариантов с описаниями, `score` — упорядоченный список из 2–32
+строковых описаний, `noul` не принимает criteria. Имена до 128 символов, описания
+до 4096; общий JSON до 64 KiB. Score использует позиции 0..N−1.
+
+Ответ: `model`, `provider=digitalocean`, `answers`, `usage.input_tokens/output_tokens`,
+`elapsed_ms`. Choice возвращает choice/probabilities/confidence, score —
+score/legend/probabilities/confidence, noul — вероятность 0..1. Это данные модели,
+не разрешение на выполнение действий. Список ответов и варианты/шкала сверяются
+с запросом. Нет автоматического повтора либо fallback, ответ ограничен 256 KiB.
+
+Используются существующие DIGITALOCEAN_API_KEY и JEV-настройки; новые secrets,
+зависимости и env не нужны. API_TOKEN проверяется тем же способом, что для
+`/classify/dokbot`; этот фиксированный маршрут и его prompt сохраняются и
+используют общий transport. Контракт соответствует
+[DigitalOcean System One API](https://docs.digitalocean.com/products/inference/how-to/use-system-one-api/).
