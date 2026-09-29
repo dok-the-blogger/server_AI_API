@@ -308,3 +308,22 @@ score/legend/probabilities/confidence, noul — вероятность 0..1. Э�
 `/classify/dokbot`; этот фиксированный маршрут и его prompt сохраняются и
 используют общий transport. Контракт соответствует
 [DigitalOcean System One API](https://docs.digitalocean.com/products/inference/how-to/use-system-one-api/).
+
+
+### Stateless free generation: POST /generate
+
+Authenticated with the existing API token. Required `input` (1..131072 chars)
+and `instruction` (1..16000 chars); serialized payload at most 256 KiB UTF-8.
+`model` defaults to `mimo-v2.6-flash`; also supports `mimo-v2.6-pro`,
+`glm-5.3-flash`, `deepseek-v4.1-flash`. `max_output_tokens` is an integer
+64..8192 (default 2048), including any provider reasoning tokens.
+Uses existing completion clients/credentials/timeout without retries or fallback.
+Instruction is a system message; input is a user message. No preset, tools or session.
+
+Returns `text` preserving formatting, `finish_reason` (`stop` or `length`),
+`truncated` (true for length), provider/model, usage, elapsed_ms,
+`prompt_version=generate-v1` and SHA-256 `prompt_hash` of instruction.
+A length stop returns partial text explicitly; invalid/empty answers are rejected.
+Response limit is 256 KiB and text limit 131072 characters. No persistence.
+`generation_not_configured` identifies an unavailable configured provider.
+Existing summary limits/defaults and chat/classification contracts remain unchanged.

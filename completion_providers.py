@@ -61,7 +61,7 @@ class ChatCompletionsProvider:
     async def aclose(self):
         await self.http.aclose()
 
-    async def complete(self, payload: dict, *, timeout: float) -> bytes:
+    async def complete(self, payload: dict, *, timeout: float, max_bytes: int = MAX_RESPONSE_BYTES) -> bytes:
         """Return bounded bytes; each operation validates its own output contract."""
         try:
             async with asyncio.timeout(timeout):
@@ -71,7 +71,7 @@ class ChatCompletionsProvider:
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
-                        if len(body) > MAX_RESPONSE_BYTES:
+                        if len(body) > max_bytes:
                             raise CompletionError(502, "invalid_provider_response",
                                                   "Completion response is too large")
                     return bytes(body)
