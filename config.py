@@ -5,6 +5,7 @@ from completion_providers import MimoChatModel
 class Settings(BaseSettings):
     API_TOKEN: str = ""        # Bearer-токен для авторизации
     RESEARCH_CONFIG_PATH: str = ""  # Optional private server research configuration
+    RESEARCH_API_TOKEN: str = ""  # Research-only Bearer; falls back to API_TOKEN
     GIGACHAT_CREDENTIALS: str = "" # Креды для GigaChat
     GIGACHAT_ID: str = ""
     GIGACHAT_MODEL: str = "GigaChat-2"

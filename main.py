@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
     load_profiles()
     app.state.research_controller = None
     app.state.research_worker = None
-    app.state.research_service_token = settings.API_TOKEN
+    app.state.research_service_token = settings.RESEARCH_API_TOKEN or settings.API_TOKEN
 
     if settings.GROK_API_KEY:
         app.state.xai_client = AsyncOpenAI(
@@ -48,7 +48,8 @@ async def lifespan(app: FastAPI):
     try:
         try:
             app.state.research_controller, app.state.research_worker = start_research(
-                settings.RESEARCH_CONFIG_PATH, service_token_configured=bool(settings.API_TOKEN))
+                settings.RESEARCH_CONFIG_PATH,
+                service_token_configured=bool(app.state.research_service_token))
         except ResearchError:
             # Misconfigured research does not disable existing AI routes.
             pass
