@@ -6,8 +6,12 @@ from pathlib import Path
 import re
 import uuid
 
-import pilot
-from bootstrap import redact
+if __package__:
+    from . import pilot
+    from .bootstrap import redact
+else:
+    import pilot
+    from bootstrap import redact
 
 
 def prepared_attempt(run_dir: Path) -> tuple[dict, dict]:

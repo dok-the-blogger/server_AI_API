@@ -140,9 +140,9 @@ class PilotProtocolTests(unittest.TestCase):
     def write_snapshot(self):
         self.snapshot.write_text(json.dumps(self.sample), encoding="utf-8")
 
-    def prepare(self, project_id=None, spend_limit_cents=300, no_spend_limit=False):
+    def prepare(self, project_id=None, spend_limit_cents=300, no_spend_limit=False, **research_options):
         return pilot.prepare(self.skill, self.snapshot, self.run_dir, pilot.DEFAULT_MODEL,
-                             False, spend_limit_cents, project_id, no_spend_limit)
+                             False, spend_limit_cents, project_id, no_spend_limit, **research_options)
 
     def mark_submitted(self, phase="in_progress"):
         self.prepare()
@@ -161,6 +161,62 @@ class PilotProtocolTests(unittest.TestCase):
         self.assertNotIn("budget_control", manifest)
         self.assertNotIn("budget_control", pilot.receipt(self.run_dir))
         self.assertEqual(pilot.budget_policy(self.run_dir), {"kind": "session", "limit_cents": 300})
+
+    def test_new_prepare_defaults_to_sol_without_forcing_reasoning(self):
+        manifest = pilot.prepare(self.skill, self.snapshot, self.run_dir)
+        request = json.loads((self.run_dir / "request.json").read_text())
+        self.assertEqual(manifest["model"], "gpt-6.1-sol")
+        self.assertEqual(manifest["research_mode"], "general")
+        self.assertEqual(manifest["context_layout_version"], 2)
+        self.assertIsNone(manifest["reasoning_effort"])
+        self.assertNotIn("reasoning", request["agent"])
+        self.assertEqual(manifest["research_window"]["end_at"], manifest["research_as_of"])
+
+    def test_new_signals_preparation_preserves_instructions_and_stable_context(self):
+        self.sample["archive_articles"] = [
+            {"article_id": "a", "version": 3, "body_text": "Archive full text", "read_at": "2026-11-12T01:00:00Z"}]
+        self.sample["memory_records"] = [
+            {"memory_id": "m", "revision": 2, "body": "Editorial memory", "read_interval": {"start": "earlier"}}]
+        self.sample["radar_signals"] = [{"signal_id": "r1", "version": 1, "text": "A new fact"}]
+        self.write_snapshot()
+        first = self.prepare(no_spend_limit=True, research_mode="new_signals",
+                             research_as_of="2026-11-12T12:00:00Z", reasoning_effort="medium")
+        first_request = json.loads((self.run_dir / "request.json").read_text())
+        instructions = first_request["agent"]["instructions"]
+        self.assertIn((pilot.BASE / "dossier_contract.md").read_text(encoding="utf-8"), instructions)
+        for name in pilot.POLICY_FILES:
+            self.assertIn((self.skill / name).read_text(encoding="utf-8"), instructions)
+        self.assertEqual(first_request["agent"]["reasoning"], {"effort": "medium"})
+        self.assertEqual(first["snapshot_captured_at"], self.sample["captured_at"])
+        self.assertEqual(first["research_window"], {
+            "start_at": "2026-11-10T12:00:00+00:00", "end_at": "2026-11-12T12:00:00+00:00", "hours": 48})
+        self.sample["captured_at"] = "2026-11-12T13:00:00Z"
+        self.sample["archive_articles"][0]["read_at"] = "2026-11-12T13:00:00Z"
+        self.sample["memory_records"][0]["read_interval"] = {"start": "later"}
+        self.sample["radar_signals"][0]["version"] = 2
+        self.sample["coverage"]["missing"].append("Another documented coverage gap.")
+        self.write_snapshot()
+        second_dir = self.root / "second-run"
+        second = pilot.prepare(self.skill, self.snapshot, second_dir, pilot.DEFAULT_MODEL, False,
+                               no_spend_limit=True, research_mode="new_signals",
+                               research_as_of="2026-11-12T14:00:00Z", reasoning_effort="medium")
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(first["context_prefix_sha256"], second["context_prefix_sha256"])
+        self.assertEqual(first["instructions_sha256"], second["instructions_sha256"])
+        self.assertEqual(first["archive_context_sha256"], second["archive_context_sha256"])
+        self.assertEqual(first["memory_context_sha256"], second["memory_context_sha256"])
+        self.assertNotEqual(first["snapshot_sha256"], second["snapshot_sha256"])
+        second_request = json.loads((second_dir / "request.json").read_text())
+        restored = pilot.research_context.extract_snapshot(second_request["input"], second)
+        self.assertEqual(restored, self.sample)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_invalid_research_profile_is_rejected_before_reserving_a_run(self):
+        for options in ({"research_mode": "all_the_internet"}, {"reasoning_effort": "unknown"},
+                        {"research_as_of": "2026-11-11T23:00:00Z"}, {"research_as_of": "2026-11-12T12:00:00"}):
+            with self.subTest(options=options), self.assertRaises(pilot.PilotError):
+                self.prepare(**options)
+            self.assertFalse(self.run_dir.exists())
 
     def test_unlimited_requires_explicit_selection_and_preserves_no_fictional_limit(self):
         manifest = self.prepare(no_spend_limit=True)

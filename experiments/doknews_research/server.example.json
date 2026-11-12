@@ -1,0 +1,14 @@
+{
+  "state_dir": "/var/lib/doknews-research",
+  "skill_dir": "/etc/doknews-research/policy",
+  "worker_python": "/opt/doknews-research/venv/bin/python",
+  "openai_key_file": "/etc/doknews-research/openai.key",
+  "api_enabled": false,
+  "consumers": ["doknews-api-hourly"],
+  "model": "gpt-6.1-sol",
+  "max_signals": 3,
+  "max_snapshot_hours": 1.0,
+  "max_seconds": 900,
+  "poll_seconds": 5.0,
+  "reasoning_effort": "medium"
+}

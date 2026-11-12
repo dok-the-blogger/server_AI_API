@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 import sys
 
-import pilot
+if __package__:
+    from . import context as research_context
+    from . import pilot
+else:
+    import context as research_context
+    import pilot
 
 
 def timestamp(value: str) -> datetime:
@@ -30,7 +35,10 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
     if project_limit_confirmed and action != "run":
         raise pilot.PilotError("Project-limit confirmation is only accepted for a new run.")
     if action == "inspect":
-        import inspect_pilot
+        if __package__:
+            from . import inspect_pilot
+        else:
+            import inspect_pilot
         return inspect_pilot.preflight(run_dir)
     if action != "run":
         if not state.get("session_id") or state.get("session_deleted"):
@@ -71,11 +79,18 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
         raise pilot.PilotError("Unexpected session configuration; prepare a supported research packet.")
     agent = request.get("agent")
     expected_tools = [{"type": "web_search", "mode": "live", "context_size": "medium"}]
-    if (not isinstance(agent, dict) or set(agent) != {"model", "instructions", "tools", "service_tier"}
+    expected_agent_keys = {"model", "instructions", "tools", "service_tier"}
+    reasoning_effort = manifest.get("reasoning_effort")
+    if reasoning_effort is not None:
+        if type(reasoning_effort) is not str or reasoning_effort not in pilot.REASONING_EFFORTS:
+            raise pilot.PilotError("Prepared reasoning effort is unsupported.")
+        expected_agent_keys.add("reasoning")
+    if (not isinstance(agent, dict) or set(agent) != expected_agent_keys
             or agent.get("tools") != expected_tools
             or agent.get("service_tier") != "default"
             or request.get("environment") != {"type": "openai_hosted"}
-            or agent.get("model") != manifest.get("model")):
+            or agent.get("model") != manifest.get("model")
+            or (reasoning_effort is not None and agent.get("reasoning") != {"effort": reasoning_effort})):
         raise pilot.PilotError("Packet configuration differs from the reviewed web-research pilot.")
     limit = None
     if not unlimited_budget:
@@ -87,30 +102,51 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
                                    "purpose": "doknews_manual_research_pilot"}:
         raise pilot.PilotError("Session metadata does not match this research run.")
     body = request.get("input")
-    marker = f"DOK_RESEARCH_RUN_ID={state['run_id']}."
-    if not isinstance(body, str) or marker not in body.split("\n\n", 1)[0]:
-        raise pilot.PilotError("Prepared input does not identify this run.")
     try:
-        snapshot = json.loads(body.split("\n\n", 1)[1])
-    except (IndexError, json.JSONDecodeError) as exc:
-        raise pilot.PilotError("Prepared snapshot could not be verified.") from exc
+        snapshot = research_context.extract_snapshot(body, manifest)
+    except research_context.ContextError as exc:
+        raise pilot.PilotError(str(exc)) from exc
     pilot.validate_snapshot(snapshot)
-    if (pilot.digest(pilot.encode(snapshot)) != manifest.get("snapshot_sha256")
+    layout = manifest.get("context_layout_version", 1)
+    snapshot_bytes = (research_context.canonical_json(snapshot).encode("utf-8")
+                      if layout == 2 else pilot.encode(snapshot))
+    if (pilot.digest(snapshot_bytes) != manifest.get("snapshot_sha256")
             or snapshot.get("captured_at") != manifest.get("snapshot_captured_at")
             or snapshot.get("coverage") != manifest.get("coverage")):
         raise pilot.PilotError("Snapshot provenance does not match the prepared manifest.")
+    if layout == 2:
+        try:
+            built = research_context.build_context(snapshot, state["run_id"],
+                                                   research_mode=manifest["research_mode"],
+                                                   research_as_of=manifest["research_as_of"])
+        except research_context.ContextError as exc:
+            raise pilot.PilotError(str(exc)) from exc
+        instructions = agent.get("instructions")
+        if (type(instructions) is not str
+                or pilot.digest(instructions.encode("utf-8")) != manifest.get("instructions_sha256")
+                or pilot.digest((instructions + "\n\n" + built.stable_prefix).encode("utf-8")) != manifest.get("context_prefix_sha256")
+                or any(state.get(key) != manifest[key] for key in ("research_mode", "research_as_of", "research_window"))):
+            raise pilot.PilotError("Research context provenance or window does not match the prepared packet.")
     current_time = current_time or datetime.now(timezone.utc)
     age = (current_time - timestamp(snapshot["captured_at"])).total_seconds()
     if age < -300:
         raise pilot.PilotError("Snapshot is in the future. Check the clock and prepare a fresh packet.")
     if age > max_snapshot_hours * 3600:
         raise pilot.PilotError("Snapshot is stale. Prepare fresh source data before starting a paid run.")
+    if layout == 2:
+        research_age = (current_time - timestamp(manifest["research_as_of"])).total_seconds()
+        if research_age < -300 or research_age > max_snapshot_hours * 3600:
+            raise pilot.PilotError("Research window is stale or in the future; prepare a fresh packet.")
     prepared_age = (current_time - timestamp(manifest.get("created_at"))).total_seconds()
     if prepared_age < -300:
         raise pilot.PilotError("Prepared manifest is in the future. Check the local clock.")
     result = {"action": "run", "phase": "prepared", "run_id": state["run_id"],
               "model": agent["model"], "snapshot_age_minutes": round(max(0, age) / 60, 1),
               "new_research": True}
+    if layout == 2:
+        result.update(research_mode=manifest["research_mode"], research_as_of=manifest["research_as_of"],
+                      research_window=manifest["research_window"], context_layout_version=layout,
+                      context_prefix_sha256=manifest["context_prefix_sha256"])
     if unlimited_budget:
         result.update(budget_mode="unlimited", spend_limit_cents=None)
     elif project_budget:
@@ -139,7 +175,10 @@ def main(argv=None) -> int:
             print(json.dumps(result, ensure_ascii=True))
             return 0
         if args.action == "inspect":
-            import inspect_pilot
+            if __package__:
+                from . import inspect_pilot
+            else:
+                import inspect_pilot
             return inspect_pilot.execute(args.run_dir)
         command = [args.action, "--run-dir", str(args.run_dir)]
         if args.action == "run":

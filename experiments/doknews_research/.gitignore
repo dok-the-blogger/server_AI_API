@@ -8,5 +8,16 @@ bootstrap-diagnostics.json
 runtime-diagnostics.json
 .pilot-packages-*/
 inputs/
+state/
+.server-state/
+server.local.json
+*.key
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+reports/
+private-policy/
+private-skills/
 __pycache__/
 *.pyc

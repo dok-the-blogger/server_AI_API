@@ -1,5 +1,6 @@
 """Offline guards around the Windows entry point; no credentials or API calls."""
 from datetime import datetime, timedelta, timezone
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import json
@@ -24,12 +25,12 @@ class LauncherPreflightTests(unittest.TestCase):
         self.current = datetime.now(timezone.utc)
         self.run_dir = self.base / "prepared-run"
 
-    def prepare(self, age_hours=0.1, limit=300, project_id=None, no_spend_limit=False):
+    def prepare(self, age_hours=0.1, limit=300, project_id=None, no_spend_limit=False, **research_options):
         self.snapshot["captured_at"] = (self.current - timedelta(hours=age_hours)).isoformat()
         path = self.base / "snapshot.json"
         path.write_bytes(pilot.encode(self.snapshot))
         return pilot.prepare(self.skill, path, self.run_dir, pilot.DEFAULT_MODEL, False, limit,
-                             project_id=project_id, no_spend_limit=no_spend_limit)
+                             project_id=project_id, no_spend_limit=no_spend_limit, **research_options)
 
     def test_fresh_packet_displays_reviewed_threshold(self):
         self.prepare()
@@ -37,6 +38,67 @@ class LauncherPreflightTests(unittest.TestCase):
         self.assertEqual(result["spend_limit_cents"], 300)
         self.assertTrue(result["new_research"])
         self.assertEqual(result["snapshot_age_minutes"], 6.0)
+
+    def test_new_signals_window_and_explicit_reasoning_pass_preflight(self):
+        self.snapshot["radar_signals"] = [{"signal_id": "s1", "version": 2, "text": "A changed signal"}]
+        self.prepare(no_spend_limit=True, research_mode="new_signals", reasoning_effort="medium",
+                     research_as_of=self.current.isoformat())
+        result = launcher.preflight(self.run_dir, "run", current_time=self.current)
+        self.assertEqual(result["model"], "gpt-6.1-sol")
+        self.assertEqual(result["research_mode"], "new_signals")
+        self.assertEqual(result["research_window"], {
+            "start_at": (self.current - timedelta(hours=48)).isoformat(),
+            "end_at": self.current.isoformat(), "hours": 48})
+        self.assertEqual(result["research_as_of"], self.current.isoformat())
+
+    def test_legacy_packet_and_astra_model_remain_unchanged_and_compatible(self):
+        manifest = self.prepare()
+        request = pilot.read_json(self.run_dir / "request.json")
+        request["agent"]["model"] = manifest["model"] = "gpt-6-astra"
+        request["input"] = (f"Выполни только исследование. DOK_RESEARCH_RUN_ID={manifest['run_id']}.\n\n"
+                            + json.dumps(self.snapshot, ensure_ascii=False))
+        fields = ("context_layout_version", "research_mode", "research_as_of", "research_window",
+                  "snapshot_hash_format", "context_prefix_sha256", "instructions_sha256",
+                  "archive_context_sha256", "memory_context_sha256", "reasoning_effort")
+        for field in fields:
+            manifest.pop(field, None)
+        manifest["snapshot_sha256"] = pilot.digest(pilot.encode(self.snapshot))
+        raw = pilot.encode(request)
+        manifest["request_sha256"] = pilot.digest(raw)
+        state = pilot.receipt(self.run_dir)
+        for field in ("research_mode", "research_as_of", "research_window"):
+            state.pop(field)
+        state["request_sha256"] = pilot.digest(raw)
+        pilot.atomic_bytes(self.run_dir / "request.json", raw)
+        pilot.atomic_bytes(self.run_dir / "manifest.json", pilot.encode(manifest))
+        pilot.atomic_bytes(self.run_dir / "receipt.json", pilot.encode(state))
+        before = {name: (self.run_dir / name).read_bytes() for name in ("request.json", "manifest.json", "receipt.json")}
+        result = launcher.preflight(self.run_dir, "run", current_time=self.current)
+        self.assertEqual(result["model"], "gpt-6-astra")
+        self.assertTrue(result["new_research"])
+        self.assertNotIn("context_layout_version", result)
+        self.assertEqual(before, {name: (self.run_dir / name).read_bytes() for name in before})
+
+    def test_inconsistent_research_window_and_mixed_layout_fail_before_execution(self):
+        manifest = self.prepare(research_mode="new_signals", research_as_of=self.current.isoformat())
+        for changes in ({"research_window": {**manifest["research_window"], "hours": 24}},
+                        {"context_layout_version": 1}, {"context_layout_version": "2"}):
+            altered = {**manifest, **changes}
+            pilot.atomic_bytes(self.run_dir / "manifest.json", pilot.encode(altered))
+            with self.subTest(changes=changes), self.assertRaises(pilot.PilotError):
+                launcher.preflight(self.run_dir, "run", current_time=self.current)
+        pilot.atomic_bytes(self.run_dir / "manifest.json", pilot.encode(manifest))
+        altered = deepcopy(manifest["research_window"])
+        altered["hours"] = 24
+        pilot.update_receipt(self.run_dir, research_window=altered)
+        with self.assertRaises(pilot.PilotError):
+            launcher.preflight(self.run_dir, "run", current_time=self.current)
+        self.assertEqual(pilot.receipt(self.run_dir)["submission_attempts"], 0)
+
+    def test_future_research_time_is_rejected_even_with_a_fresh_snapshot(self):
+        self.prepare(research_as_of=(self.current + timedelta(hours=1)).isoformat())
+        with self.assertRaisesRegex(pilot.PilotError, "window.*future"):
+            launcher.preflight(self.run_dir, "run", current_time=self.current)
 
     def test_stale_snapshot_stops_before_pilot_execution(self):
         self.prepare(age_hours=7)
