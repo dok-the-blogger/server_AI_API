@@ -55,6 +55,7 @@ class FakeSessions:
         self.status = "completed"
         self.disconnect = False
         self.fail_create = False
+        self.spend_control = {"limit": 300, "consumed": 12}
         self.item_calls = []
         self.item_pages = {None: {"data": [message()], "has_more": False, "last_id": None}}
         self.events = SimpleNamespace(create=self.cancel)
@@ -75,7 +76,8 @@ class FakeSessions:
 
     def retrieve(self, session_id):
         assert session_id == SID
-        return {"id": SID, "status": "idle", "required_actions": []}
+        return {"id": SID, "status": "idle", "required_actions": [],
+                "spend_control": self.spend_control}
 
     def get_turn(self, *, turn_id, session_id):
         assert (turn_id, session_id) == (TID, SID)
@@ -133,6 +135,25 @@ class PilotProtocolTests(unittest.TestCase):
         self.assertEqual(manifest["request_sha256"], pilot.digest((self.run_dir / "request.json").read_bytes()))
         self.assertEqual(pilot.receipt(self.run_dir)["phase"], "prepared")
         self.assertEqual(self.sessions.creates, 0)
+        request = json.loads((self.run_dir / "request.json").read_text())
+        self.assertEqual(request["spend_control"], {"limit": 300})
+        self.assertEqual(request["agent"]["service_tier"], "default")
+        self.assertEqual(request["metadata"]["dok_research_run_id"], manifest["run_id"])
+
+    def test_invalid_budget_never_prepares_or_submits(self):
+        for limit in (None, 0, -1, True, 10_001):
+            with self.assertRaises(pilot.PilotError):
+                pilot.prepare(self.skill, self.snapshot, self.run_dir, pilot.DEFAULT_MODEL, False, limit)
+        self.assertFalse(self.run_dir.exists())
+
+    def test_spend_keeps_last_known_value_when_latest_unknown(self):
+        self.mark_submitted()
+        first = pilot.recover(self.client, self.run_dir)
+        self.assertEqual(first["spend_control"], {"limit": 300, "consumed": 12})
+        self.sessions.spend_control = {"limit": 300, "consumed": None}
+        later = pilot.recover(self.client, self.run_dir)
+        self.assertEqual(later["spend_control"]["consumed"], 12)
+        self.assertTrue(later["latest_spend_unknown"])
 
     def test_missing_required_policy_fails_before_creating_run(self):
         (self.skill / pilot.POLICY_FILES[2]).unlink()

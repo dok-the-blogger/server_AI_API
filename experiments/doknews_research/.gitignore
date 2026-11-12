@@ -1,7 +1,9 @@
 .venv/
+.venv-sdk-check/
 .env
 .env.local
 runs/
+prepared-run/
 inputs/
 __pycache__/
 *.pyc

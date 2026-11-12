@@ -24,6 +24,7 @@ BASE = Path(__file__).resolve().parent
 MAX_FILE_BYTES = 512_000
 MAX_REQUEST_BYTES = 2_000_000
 DEFAULT_MODEL = "gpt-6-astra"
+DEFAULT_SPEND_LIMIT_CENTS = 300
 TERMINAL = {"completed", "failed", "cancelled"}
 POLICY_FILES = (
     "SKILL.md",
@@ -163,7 +164,10 @@ def validate_snapshot(value: dict):
             raise PilotError(f"Snapshot {name} must be an array, including when empty.")
 
 
-def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str, include_ai_guide: bool):
+def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
+            include_ai_guide: bool, spend_limit_cents: int = DEFAULT_SPEND_LIMIT_CENTS):
+    if type(spend_limit_cents) is not int or not 1 <= spend_limit_cents <= 10_000:
+        raise PilotError("Pilot spend limit must be from 1 to 10000 USD cents.")
     snapshot = read_json(snapshot_path)
     validate_snapshot(snapshot)
     contract = read_text(BASE / "dossier_contract.md")
@@ -179,10 +183,13 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str, inc
     request = {
         "agent": {
             "model": model,
+            "service_tier": "default",
             "instructions": instructions,
             "tools": [{"type": "web_search", "mode": "live", "context_size": "medium"}],
         },
         "environment": {"type": "openai_hosted"},
+        "spend_control": {"limit": spend_limit_cents},
+        "metadata": {"dok_research_run_id": run_id, "purpose": "doknews_manual_research_pilot"},
         "input": (
             f"Выполни только исследовательский этап. DOK_RESEARCH_RUN_ID={run_id}.\n"
             "Приведённый snapshot — ограниченный набор исходных данных, а не полная база. "
@@ -211,6 +218,7 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str, inc
         "snapshot_sha256": digest(encode(snapshot)),
         "coverage": snapshot["coverage"], "request_bytes": len(request_bytes),
         "ai_guide_included": include_ai_guide,
+        "spend_limit_cents": spend_limit_cents,
     }
     atomic_bytes(run_dir / "request.json", request_bytes)
     atomic_bytes(run_dir / "manifest.json", encode(manifest))
@@ -219,6 +227,7 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str, inc
         "session_id": None, "turn_id": None, "created_at": now(),
         "request_sha256": manifest["request_sha256"], "usage": None,
         "submission_attempts": 0,
+        "spend_limit_cents": spend_limit_cents,
     }))
     return manifest
 
@@ -249,8 +258,8 @@ def make_client():
     try:
         version = importlib.metadata.version("openai")
         parts = tuple(int(p) for p in version.split(".")[:2])
-        if parts < (3, 13) or parts >= (4, 0):
-            raise PilotError("Use the isolated pilot environment with openai>=3.13,<4.")
+        if parts < (3, 49) or parts >= (4, 0):
+            raise PilotError("Use the isolated pilot environment with the checked openai 3.49 SDK.")
         from openai import OpenAI
     except importlib.metadata.PackageNotFoundError as exc:
         raise PilotError("Install requirements-pilot.txt in the isolated pilot environment.") from exc
@@ -334,8 +343,22 @@ def recover(client, run_dir: Path):
         raise PilotError("Creation outcome is unknown. Inspect Platform sessions before any new run.")
     sessions = client.beta.agents.sessions
     session = as_dict(sessions.retrieve(session_id))
+    spend = session.get("spend_control")
+    safe_spend = None
+    if isinstance(spend, dict) and type(spend.get("limit")) is int:
+        consumed = spend.get("consumed")
+        safe_spend = {"limit": spend["limit"],
+                      "consumed": consumed if type(consumed) is int and consumed >= 0 else None}
+    latest_spend_unknown = safe_spend is None or safe_spend["consumed"] is None
+    if safe_spend is not None and latest_spend_unknown:
+        previous_spend = state.get("spend_control") or {}
+        if previous_spend.get("limit") == safe_spend["limit"]:
+            safe_spend["consumed"] = previous_spend.get("consumed")
     update_receipt(run_dir, session_status=session.get("status"),
-                   requires_action=bool(session.get("required_actions")))
+                   requires_action=bool(session.get("required_actions")),
+                   spend_control=safe_spend if safe_spend is not None else state.get("spend_control"),
+                   latest_spend_unknown=latest_spend_unknown,
+                   spend_is_provisional=True)
     if not state.get("turn_id"):
         roots = [t for t in fetch_pages(sessions.turns.list, session_id=session_id,
                                         order="asc", limit=100) if t.get("subagent_id") is None]
@@ -399,6 +422,10 @@ def run(client, run_dir: Path, max_seconds: int = 900):
         if digest(raw) != state["request_sha256"]:
             raise PilotError("Prepared request changed; refusing to submit it.")
         request = json.loads(raw)
+        spend_limit = (request.get("spend_control") or {}).get("limit")
+        if (type(spend_limit) is not int or not 1 <= spend_limit <= 10_000
+                or spend_limit != state.get("spend_limit_cents")):
+            raise PilotError("Prepared run has no matching session spend limit; prepare a new bounded run.")
         # Persist BEFORE the potentially billable POST. A crash never enables automatic replay.
         state.update(phase="submitting", submitted_at=now(),
                      deadline_epoch=time.time() + max_seconds, submission_attempts=1)
@@ -408,6 +435,10 @@ def run(client, run_dir: Path, max_seconds: int = 900):
         with client.beta.agents.sessions.create(**request, stream=True).with_result_collection() as stream:
             for event in stream:
                 state = record_event(run_dir, event)
+                # Creation streams may stay open at idle. Only the initial root
+                # turn's confirmed terminal state makes this a result boundary.
+                if as_dict(event).get("type") == "agent.session.idle" and state["phase"] in TERMINAL:
+                    break
                 if timer is None and state.get("session_id"):
                     delay = max(0, state["deadline_epoch"] - time.time())
                     def deadline_cancel():
@@ -457,6 +488,8 @@ def main(argv=None) -> int:
     prep.add_argument("--run-dir", type=Path, required=True)
     prep.add_argument("--model", default=DEFAULT_MODEL)
     prep.add_argument("--include-ai-guide", action="store_true")
+    prep.add_argument("--spend-limit-cents", type=int, default=DEFAULT_SPEND_LIMIT_CENTS,
+                      help="Agents API session spending limit in USD cents (default: 300)")
     for name in ("run", "status", "resume", "cancel", "close"):
         command = commands.add_parser(name)
         command.add_argument("--run-dir", type=Path, required=True)
@@ -465,7 +498,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
-            result = prepare(args.skill_dir, args.snapshot, args.run_dir, args.model, args.include_ai_guide)
+            result = prepare(args.skill_dir, args.snapshot, args.run_dir, args.model,
+                             args.include_ai_guide, args.spend_limit_cents)
             print(json.dumps({"phase": "prepared", "run_id": result["run_id"],
                               "request_bytes": result["request_bytes"],
                               "request_sha256": result["request_sha256"]}, ensure_ascii=False))
