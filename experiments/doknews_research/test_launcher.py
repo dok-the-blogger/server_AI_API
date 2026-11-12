@@ -24,11 +24,12 @@ class LauncherPreflightTests(unittest.TestCase):
         self.current = datetime.now(timezone.utc)
         self.run_dir = self.base / "prepared-run"
 
-    def prepare(self, age_hours=0.1, limit=300):
+    def prepare(self, age_hours=0.1, limit=300, project_id=None):
         self.snapshot["captured_at"] = (self.current - timedelta(hours=age_hours)).isoformat()
         path = self.base / "snapshot.json"
         path.write_bytes(pilot.encode(self.snapshot))
-        return pilot.prepare(self.skill, path, self.run_dir, pilot.DEFAULT_MODEL, False, limit)
+        return pilot.prepare(self.skill, path, self.run_dir, pilot.DEFAULT_MODEL, False, limit,
+                             project_id=project_id)
 
     def test_fresh_packet_displays_reviewed_threshold(self):
         self.prepare()
@@ -67,6 +68,34 @@ class LauncherPreflightTests(unittest.TestCase):
                              session_id="sess_test", turn_id="turn_test")
         result = launcher.preflight(self.run_dir, "resume", current_time=self.current)
         self.assertFalse(result["new_research"])
+
+    def test_project_packet_without_confirmation_never_reaches_execution(self):
+        self.prepare(project_id="proj_pilot_test")
+        with patch.object(pilot, "main") as execute:
+            self.assertEqual(launcher.main(["execute", "--run-dir", str(self.run_dir)]), 2)
+        execute.assert_not_called()
+        self.assertEqual(pilot.receipt(self.run_dir)["submission_attempts"], 0)
+
+    def test_project_budget_is_labelled_monthly_and_confirmation_is_forwarded(self):
+        self.prepare(project_id="proj_pilot_test")
+        result = launcher.preflight(self.run_dir, "run", current_time=self.current,
+                                    project_limit_confirmed=True)
+        self.assertEqual(result["project_monthly_limit_cents"], 300)
+        self.assertEqual(result["project_id"], "proj_pilot_test")
+        self.assertFalse(result["project_limit_verified_by_api"])
+        self.assertNotIn("spend_limit_cents", result)
+        with patch.object(pilot, "main", return_value=0) as execute:
+            code = launcher.main(["execute", "--run-dir", str(self.run_dir),
+                                  "--project-limit-confirmed"])
+        self.assertEqual(code, 0)
+        self.assertIn("--project-limit-confirmed", execute.call_args.args[0])
+
+    def test_project_confirmation_cannot_relabel_a_session_packet(self):
+        self.prepare()
+        with self.assertRaises(pilot.PilotError):
+            launcher.preflight(self.run_dir, "run", project_limit_confirmed=True)
+        with self.assertRaises(pilot.PilotError):
+            launcher.preflight(self.run_dir, "inspect", project_limit_confirmed=True)
 
 
 if __name__ == "__main__":

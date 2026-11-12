@@ -5,7 +5,8 @@ param(
     [string]$RunDir = '',
     [ValidateSet('File', 'Prompt')][string]$KeyMode = 'File',
     [ValidateRange(30, 3600)][int]$MaxSeconds = 900,
-    [ValidateRange(1, 24)][int]$MaxSnapshotHours = 6
+    [ValidateRange(1, 24)][int]$MaxSnapshotHours = 6,
+    [switch]$ProjectLimitConfirmed
 )
 
 Set-StrictMode -Version Latest
@@ -108,7 +109,7 @@ function Read-PilotKey {
             $picker = New-Object System.Windows.Forms.OpenFileDialog
             try {
                 $picker.Title = 'Choose the downloaded OpenAI API key file (kept local)'
-                $picker.Filter = 'Text and JSON (*.txt;*.json)|*.txt;*.json|All files (*.*)|*.*'
+                $picker.Filter = 'API key files (*.key;*.txt;*.json)|*.key;*.txt;*.json|All files (*.*)|*.*'
                 $picker.Multiselect = $false
                 $downloads = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads'
                 if (Test-Path -LiteralPath $downloads -PathType Container) { $picker.InitialDirectory = $downloads }
@@ -139,6 +140,7 @@ try {
     $runtimeCommand = $python.Prefix + @('-I', '-S', '-X', 'utf8', $runtime)
     $common = @('--action', $Action, '--run-dir', $RunDir, '--max-seconds', [string]$MaxSeconds,
                 '--max-snapshot-hours', [string]$MaxSnapshotHours)
+    if ($ProjectLimitConfirmed) { $common += '--project-limit-confirmed' }
     $script:Step = 'checking the prepared packet (offline)'
     $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($runtimeCommand + @('check') + $common)
     if ($code -ne 0) { exit $code }
@@ -154,7 +156,12 @@ try {
     if (-not $key) { Write-Host 'Cancelled before contacting the API.'; exit 0 }
     $script:Step = 'running the pilot'
     if ($Action -eq 'run') {
-        Write-Host 'Starting one paid research session with the spend threshold shown above (USD cents).'
+        if ($ProjectLimitConfirmed) {
+            Write-Host 'Starting one paid research session using the operator-confirmed project MONTHLY hard limit.'
+            Write-Host 'The request has no session spend_control. This program has not verified the project setting through the API.'
+        } else {
+            Write-Host 'Starting one paid research session with the spend threshold shown above (USD cents).'
+        }
         Write-Host 'The threshold is not an exact final bill. Closing this window does not prove remote cancellation.'
     } elseif ($Action -eq 'inspect') {
         Write-Host 'Inspecting saved attempt with GET requests only; no new research will be submitted.'

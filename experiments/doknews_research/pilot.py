@@ -34,6 +34,7 @@ POLICY_FILES = (
 )
 AI_GUIDE = "references/DOKNEWS_AI_EDITORIAL_GUIDE.md"
 SECRET_PATTERN = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{24,}")
+PROJECT_ID_PATTERN = re.compile(r"proj_[A-Za-z0-9_-]{1,100}")
 
 
 class PilotError(Exception):
@@ -165,9 +166,18 @@ def validate_snapshot(value: dict):
 
 
 def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
-            include_ai_guide: bool, spend_limit_cents: int = DEFAULT_SPEND_LIMIT_CENTS):
+            include_ai_guide: bool, spend_limit_cents: int = DEFAULT_SPEND_LIMIT_CENTS,
+            project_id: str | None = None):
     if type(spend_limit_cents) is not int or not 1 <= spend_limit_cents <= 10_000:
         raise PilotError("Pilot spend limit must be from 1 to 10000 USD cents.")
+    project_budget = None
+    if project_id is not None:
+        if type(project_id) is not str or not PROJECT_ID_PATTERN.fullmatch(project_id):
+            raise PilotError("Expected an explicit project ID beginning with proj_.")
+        if spend_limit_cents > 300:
+            raise PilotError("This pilot's project monthly hard limit must be from 1 to 300 USD cents.")
+        project_budget = {"kind": "project_hard_limit", "project_id": project_id,
+                          "monthly_limit_cents": spend_limit_cents}
     snapshot = read_json(snapshot_path)
     validate_snapshot(snapshot)
     contract = read_text(BASE / "dossier_contract.md")
@@ -199,6 +209,10 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
             + json.dumps(snapshot, ensure_ascii=False)
         ),
     }
+    if project_budget is not None:
+        # This is a separate, explicitly selected budget mode. The operator must
+        # confirm the external monthly project hard limit before submission.
+        del request["spend_control"]
     request_bytes = encode(request)
     if len(request_bytes) > MAX_REQUEST_BYTES:
         raise PilotError("Prepared request is too large; reduce the source snapshot.")
@@ -220,16 +234,77 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
         "ai_guide_included": include_ai_guide,
         "spend_limit_cents": spend_limit_cents,
     }
+    if project_budget is not None:
+        manifest["budget_control"] = project_budget
     atomic_bytes(run_dir / "request.json", request_bytes)
     atomic_bytes(run_dir / "manifest.json", encode(manifest))
-    atomic_bytes(run_dir / "receipt.json", encode({
+    state = {
         "schema_version": 1, "run_id": run_id, "phase": "prepared",
         "session_id": None, "turn_id": None, "created_at": now(),
         "request_sha256": manifest["request_sha256"], "usage": None,
         "submission_attempts": 0,
         "spend_limit_cents": spend_limit_cents,
-    }))
+    }
+    if project_budget is not None:
+        state["budget_control"] = project_budget
+    atomic_bytes(run_dir / "receipt.json", encode(state))
     return manifest
+
+
+def _checked_project_budget(policy, legacy_limit) -> dict:
+    fields = {"kind", "project_id", "monthly_limit_cents"}
+    if (type(policy) is not dict or set(policy) != fields
+            or policy.get("kind") != "project_hard_limit"):
+        raise PilotError("Invalid project budget policy format.")
+    project_id, limit = policy["project_id"], policy["monthly_limit_cents"]
+    if (type(project_id) is not str or not PROJECT_ID_PATTERN.fullmatch(project_id)
+            or type(limit) is not int or not 1 <= limit <= 300
+            or type(legacy_limit) is not int or legacy_limit != limit):
+        raise PilotError("Invalid or inconsistent project monthly hard-limit policy.")
+    return dict(policy)
+
+
+def budget_policy(run_dir: Path, request: dict | None = None) -> dict:
+    """Validate the saved budget mode; this does not verify Platform settings."""
+    state = receipt(run_dir)
+    manifest = read_json(run_dir / "manifest.json")
+    if type(manifest) is not dict or manifest.get("schema_version") != 1:
+        raise PilotError("Unsupported or corrupt run manifest.")
+    if (type(state.get("run_id")) is not str or manifest.get("run_id") != state["run_id"]
+            or type(state.get("request_sha256")) is not str
+            or not re.fullmatch(r"[a-f0-9]{64}", state["request_sha256"])
+            or manifest.get("request_sha256") != state["request_sha256"]):
+        raise PilotError("Prepared manifest and receipt identities do not match.")
+    if request is None:
+        path = run_dir / "request.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_REQUEST_BYTES:
+            raise PilotError("Expected the original bounded prepared request.")
+        raw = path.read_bytes()
+        if digest(raw) != state.get("request_sha256") or digest(raw) != manifest.get("request_sha256"):
+            raise PilotError("Prepared request changed; refusing to use its budget policy.")
+        try:
+            request = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise PilotError("Invalid prepared request JSON.") from exc
+    if type(request) is not dict:
+        raise PilotError("Prepared request must be an object.")
+    if "budget_control" in manifest or "budget_control" in state:
+        policy = _checked_project_budget(manifest.get("budget_control"), manifest.get("spend_limit_cents"))
+        saved_policy = _checked_project_budget(state.get("budget_control"), state.get("spend_limit_cents"))
+        if policy != saved_policy:
+            raise PilotError("Project budget policy does not match the manifest and receipt.")
+        if "spend_control" in request:
+            raise PilotError("A project hard-limit request must not contain session spend_control.")
+        return policy
+    spend = request.get("spend_control")
+    limit = spend.get("limit") if type(spend) is dict else None
+    if (type(spend) is not dict or set(spend) != {"limit"}
+            or type(limit) is not int or not 1 <= limit <= 10_000
+            or type(manifest.get("spend_limit_cents")) is not int
+            or type(state.get("spend_limit_cents")) is not int
+            or limit != manifest["spend_limit_cents"] or limit != state["spend_limit_cents"]):
+        raise PilotError("Prepared run has no matching session spend limit; prepare a new bounded run.")
+    return {"kind": "session", "limit_cents": limit}
 
 
 def as_dict(value) -> dict:
@@ -332,7 +407,9 @@ def failure_code(value):
     return code if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else None
 
 
-def make_client():
+def make_client(project_id: str | None = None):
+    if project_id is not None and (type(project_id) is not str or not PROJECT_ID_PATTERN.fullmatch(project_id)):
+        raise PilotError("Invalid project ID for the API client.")
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
         raise PilotError("OPENAI_API_KEY is not configured in this process. Do not paste it into chat.")
@@ -345,7 +422,21 @@ def make_client():
     except importlib.metadata.PackageNotFoundError as exc:
         raise PilotError("Install requirements-pilot.txt in the isolated pilot environment.") from exc
     # Never inherit a different provider's OPENAI_BASE_URL. Disable SDK POST retries.
-    return OpenAI(api_key=key, base_url="https://api.openai.com/v1", max_retries=0, timeout=60)
+    return OpenAI(api_key=key, base_url="https://api.openai.com/v1", max_retries=0, timeout=60,
+                  **({"project": project_id} if project_id is not None else {}))
+
+
+def client_for_run(run_dir: Path):
+    """Keep lifecycle operations bound even if the original inputs are damaged.
+
+    This validates routing from the receipt only. run() separately validates the
+    entire immutable packet before any new submission.
+    """
+    state = receipt(run_dir)
+    if "budget_control" in state:
+        policy = _checked_project_budget(state["budget_control"], state.get("spend_limit_cents"))
+        return make_client(project_id=policy["project_id"])
+    return make_client()
 
 
 def record_event(run_dir: Path, event):
@@ -494,7 +585,7 @@ def close_session(client, run_dir: Path):
                            environment_cleanup="asynchronous")
 
 
-def run(client, run_dir: Path, max_seconds: int = 900):
+def run(client, run_dir: Path, max_seconds: int = 900, project_limit_confirmed: bool = False):
     with locked(run_dir):
         state = receipt(run_dir)
         if state["phase"] != "prepared":
@@ -503,10 +594,20 @@ def run(client, run_dir: Path, max_seconds: int = 900):
         if digest(raw) != state["request_sha256"]:
             raise PilotError("Prepared request changed; refusing to submit it.")
         request = json.loads(raw)
-        spend_limit = (request.get("spend_control") or {}).get("limit")
-        if (type(spend_limit) is not int or not 1 <= spend_limit <= 10_000
-                or spend_limit != state.get("spend_limit_cents")):
-            raise PilotError("Prepared run has no matching session spend limit; prepare a new bounded run.")
+        policy = budget_policy(run_dir, request)
+        if type(project_limit_confirmed) is not bool:
+            raise PilotError("Project hard-limit confirmation must be an explicit boolean flag.")
+        if policy["kind"] == "project_hard_limit":
+            if not project_limit_confirmed:
+                raise PilotError("Confirm the configured monthly project hard limit with --project-limit-confirmed before run.")
+            if getattr(client, "project", None) != policy["project_id"]:
+                raise PilotError("The API client is not bound to the saved budget project; no request was submitted.")
+            state["project_limit_confirmation"] = {
+                "confirmed_at": now(), "verified_by_api": False,
+                "project_id": policy["project_id"], "monthly_limit_cents": policy["monthly_limit_cents"],
+            }
+        elif project_limit_confirmed:
+            raise PilotError("--project-limit-confirmed is only valid for a prepared project hard-limit run.")
         # Persist BEFORE the potentially billable POST. A crash never enables automatic replay.
         state.update(phase="submitting", submitted_at=now(), api_stage="create_request",
                      deadline_epoch=time.time() + max_seconds, submission_attempts=1)
@@ -619,28 +720,33 @@ def main(argv=None) -> int:
     prep.add_argument("--model", default=DEFAULT_MODEL)
     prep.add_argument("--include-ai-guide", action="store_true")
     prep.add_argument("--spend-limit-cents", type=int, default=DEFAULT_SPEND_LIMIT_CENTS,
-                      help="Agents API session spending limit in USD cents (default: 300)")
+                      help="Session limit, or project monthly hard limit with --project-id, in USD cents (default: 300)")
+    prep.add_argument("--project-id", help="Select externally configured project monthly hard-limit mode (maximum 300 cents)")
     for name in ("run", "status", "resume", "cancel", "close"):
         command = commands.add_parser(name)
         command.add_argument("--run-dir", type=Path, required=True)
         if name == "run":
             command.add_argument("--max-seconds", type=int, default=900)
+            command.add_argument("--project-limit-confirmed", action="store_true",
+                                 help="Confirm the stated monthly hard limit is enforced on the saved project; not an API verification")
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
             result = prepare(args.skill_dir, args.snapshot, args.run_dir, args.model,
-                             args.include_ai_guide, args.spend_limit_cents)
-            print(json.dumps({"phase": "prepared", "run_id": result["run_id"],
-                              "request_bytes": result["request_bytes"],
-                              "request_sha256": result["request_sha256"]}, ensure_ascii=False))
+                             args.include_ai_guide, args.spend_limit_cents, args.project_id)
+            summary = {"phase": "prepared", "run_id": result["run_id"],
+                       "request_bytes": result["request_bytes"], "request_sha256": result["request_sha256"]}
+            if "budget_control" in result:
+                summary["budget_control"] = result["budget_control"]
+            print(json.dumps(summary, ensure_ascii=False))
         else:
             if args.run_dir.is_symlink() or not args.run_dir.is_dir():
                 raise PilotError("Expected an existing regular run directory.")
             if args.command == "run" and not 30 <= args.max_seconds <= 3600:
                 raise PilotError("--max-seconds must be from 30 to 3600; it is not a dollar cap.")
-            with make_client() as client:
+            with client_for_run(args.run_dir) as client:
                 if args.command == "run":
-                    result = run(client, args.run_dir, args.max_seconds)
+                    result = run(client, args.run_dir, args.max_seconds, args.project_limit_confirmed)
                 elif args.command == "cancel":
                     result = request_cancel(client, args.run_dir)
                 elif args.command == "close":

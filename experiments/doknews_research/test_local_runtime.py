@@ -27,6 +27,7 @@ class LocalRuntimeTests(unittest.TestCase):
             "def main(argv):\n"
             " if argv[0]=='execute': Path(__file__).with_name('execution.flag').write_text('executed')\n"
             " print(json.dumps({'command':argv[0], 'isolated':bool(sys.flags.isolated), "
+            "'project_limit_confirmed':'--project-limit-confirmed' in argv, "
             "'no_site':bool(sys.flags.no_site), 'injected':importlib.util.find_spec('injected_module') is not None, "
             "'paths':sys.path}))\n"
             " return 0\n", encoding="utf-8")
@@ -72,6 +73,17 @@ class LocalRuntimeTests(unittest.TestCase):
         result = self.run_cli("execute", "--run-dir", str(self.root), isolated=False)
         self.assertEqual(result.returncode, 2)
         self.assertIn("-I -S", result.stderr)
+        self.assertFalse((self.root / "execution.flag").exists())
+
+    def test_explicit_project_confirmation_survives_isolated_forwarding(self):
+        result = self.run_cli("check", "--run-dir", str(self.root / "prepared-run"),
+                              "--project-limit-confirmed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["project_limit_confirmed"])
+        duplicate = self.run_cli("check", "--run-dir", str(self.root / "prepared-run"),
+                                 "--project-limit-confirmed", "--project-limit-confirmed")
+        self.assertEqual(duplicate.returncode, 2)
+        self.assertIn("Duplicate project-limit confirmation", duplicate.stderr)
         self.assertFalse((self.root / "execution.flag").exists())
 
     def test_install_failure_never_creates_marker_or_executes(self):

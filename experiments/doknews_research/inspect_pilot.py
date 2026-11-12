@@ -99,7 +99,7 @@ def inspect_attempt(client, run_dir: Path) -> dict:
 
 
 def execute(run_dir: Path) -> int:
-    with pilot.make_client() as client:
+    with pilot.client_for_run(run_dir) as client:
         report = inspect_attempt(client, run_dir)
     print(json.dumps(report, ensure_ascii=True, indent=2))
     print(f"Read-only inspection saved: {run_dir / 'inspection.json'}")

@@ -21,11 +21,14 @@ def timestamp(value: str) -> datetime:
 
 
 def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
-              current_time: datetime | None = None) -> dict:
+              current_time: datetime | None = None,
+              project_limit_confirmed: bool = False) -> dict:
     """Validate locally before collecting credentials, and again before a paid run."""
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise pilot.PilotError("Prepared run directory is missing or is a link.")
     state = pilot.receipt(run_dir)
+    if project_limit_confirmed and action != "run":
+        raise pilot.PilotError("Project-limit confirmation is only accepted for a new run.")
     if action == "inspect":
         import inspect_pilot
         return inspect_pilot.preflight(run_dir)
@@ -51,8 +54,19 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
             or state.get("request_sha256") != pilot.digest(raw)):
         raise pilot.PilotError("Prepared request, manifest and receipt do not match.")
     request = json.loads(raw)
+    budget = pilot.budget_policy(run_dir, request)
+    project_budget = budget["kind"] == "project_hard_limit"
+    if project_budget and project_limit_confirmed is not True:
+        raise pilot.PilotError(
+            "Confirm the configured hard monthly limit for this exact Platform project before running. "
+            "The pilot cannot verify that setting with its ordinary API key.")
+    if not project_budget and project_limit_confirmed:
+        raise pilot.PilotError("This packet uses a session limit, not a project-limit confirmation.")
     # This launcher accepts only the small research-only configuration we prepared.
-    if set(request) != {"agent", "environment", "input", "spend_control", "metadata"}:
+    expected_keys = {"agent", "environment", "input", "metadata"}
+    if not project_budget:
+        expected_keys.add("spend_control")
+    if set(request) != expected_keys:
         raise pilot.PilotError("Unexpected session configuration; prepare a supported research packet.")
     agent = request.get("agent")
     expected_tools = [{"type": "web_search", "mode": "live", "context_size": "medium"}]
@@ -62,10 +76,7 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
             or request.get("environment") != {"type": "openai_hosted"}
             or agent.get("model") != manifest.get("model")):
         raise pilot.PilotError("Packet configuration differs from the reviewed web-research pilot.")
-    spend = request.get("spend_control")
-    if not isinstance(spend, dict) or set(spend) != {"limit"}:
-        raise pilot.PilotError("Missing reviewed API spend control.")
-    limit = spend.get("limit")
+    limit = budget["monthly_limit_cents"] if project_budget else budget["limit_cents"]
     if (type(limit) is not int or not 1 <= limit <= 300
             or limit != manifest.get("spend_limit_cents") or limit != state.get("spend_limit_cents")):
         raise pilot.PilotError("Spend threshold must match the prepared packet and be at most 300 USD cents.")
@@ -94,9 +105,15 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
     prepared_age = (current_time - timestamp(manifest.get("created_at"))).total_seconds()
     if prepared_age < -300:
         raise pilot.PilotError("Prepared manifest is in the future. Check the local clock.")
-    return {"action": "run", "phase": "prepared", "run_id": state["run_id"],
-            "model": agent["model"], "snapshot_age_minutes": round(max(0, age) / 60, 1),
-            "spend_limit_cents": limit, "new_research": True}
+    result = {"action": "run", "phase": "prepared", "run_id": state["run_id"],
+              "model": agent["model"], "snapshot_age_minutes": round(max(0, age) / 60, 1),
+              "new_research": True}
+    if project_budget:
+        result.update(project_id=budget["project_id"], project_monthly_limit_cents=limit,
+                      project_limit_confirmed_by_operator=True, project_limit_verified_by_api=False)
+    else:
+        result["spend_limit_cents"] = limit
+    return result
 
 
 def main(argv=None) -> int:
@@ -106,11 +123,13 @@ def main(argv=None) -> int:
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--max-snapshot-hours", type=float, default=6)
     parser.add_argument("--max-seconds", type=int, default=900)
+    parser.add_argument("--project-limit-confirmed", action="store_true")
     args = parser.parse_args(argv)
     try:
         if not 30 <= args.max_seconds <= 3600:
             raise pilot.PilotError("Observation limit must be from 30 to 3600 seconds.")
-        result = preflight(args.run_dir, args.action, args.max_snapshot_hours)
+        result = preflight(args.run_dir, args.action, args.max_snapshot_hours,
+                           project_limit_confirmed=args.project_limit_confirmed)
         if args.command == "check":
             print(json.dumps(result, ensure_ascii=True))
             return 0
@@ -120,6 +139,8 @@ def main(argv=None) -> int:
         command = [args.action, "--run-dir", str(args.run_dir)]
         if args.action == "run":
             command += ["--max-seconds", str(args.max_seconds)]
+            if args.project_limit_confirmed:
+                command.append("--project-limit-confirmed")
         return pilot.main(command)
     except pilot.PilotError as exc:
         print(f"Pilot: {exc}", file=sys.stderr)

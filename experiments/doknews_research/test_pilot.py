@@ -14,6 +14,7 @@ import pilot
 
 SID = "sess_test"
 TID = "turn_test"
+PROJECT_ID = "proj_offline_budget_test"
 HAS_SDK = importlib.util.find_spec("openai") is not None
 
 
@@ -138,8 +139,9 @@ class PilotProtocolTests(unittest.TestCase):
     def write_snapshot(self):
         self.snapshot.write_text(json.dumps(self.sample), encoding="utf-8")
 
-    def prepare(self):
-        return pilot.prepare(self.skill, self.snapshot, self.run_dir, pilot.DEFAULT_MODEL, False)
+    def prepare(self, project_id=None, spend_limit_cents=300):
+        return pilot.prepare(self.skill, self.snapshot, self.run_dir, pilot.DEFAULT_MODEL,
+                             False, spend_limit_cents, project_id)
 
     def mark_submitted(self, phase="in_progress"):
         self.prepare()
@@ -155,6 +157,207 @@ class PilotProtocolTests(unittest.TestCase):
         self.assertEqual(request["spend_control"], {"limit": 300})
         self.assertEqual(request["agent"]["service_tier"], "default")
         self.assertEqual(request["metadata"]["dok_research_run_id"], manifest["run_id"])
+        self.assertNotIn("budget_control", manifest)
+        self.assertNotIn("budget_control", pilot.receipt(self.run_dir))
+        self.assertEqual(pilot.budget_policy(self.run_dir), {"kind": "session", "limit_cents": 300})
+
+    def test_project_budget_is_explicit_and_preserved_without_session_spend_control(self):
+        manifest = self.prepare(PROJECT_ID)
+        state = pilot.receipt(self.run_dir)
+        request = json.loads((self.run_dir / "request.json").read_text())
+        expected = {"kind": "project_hard_limit", "project_id": PROJECT_ID, "monthly_limit_cents": 300}
+        self.assertNotIn("spend_control", request)
+        self.assertEqual(manifest["budget_control"], expected)
+        self.assertEqual(state["budget_control"], expected)
+        self.assertEqual(pilot.budget_policy(self.run_dir), expected)
+        self.assertEqual(manifest["spend_limit_cents"], 300)
+        self.assertEqual(state["spend_limit_cents"], 300)
+        self.assertNotIn("project_limit_confirmation", state)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_invalid_project_or_excessive_project_budget_is_never_prepared(self):
+        for project_id, limit in (("", 300), ("not_a_project", 300), ("proj_", 300),
+                                  ("proj_bad\nheader", 300), ("proj_" + "a" * 101, 300),
+                                  (PROJECT_ID, 301), (PROJECT_ID, True)):
+            with self.subTest(project_id=project_id, limit=limit), self.assertRaises(pilot.PilotError):
+                self.prepare(project_id, limit)
+            self.assertFalse(self.run_dir.exists())
+
+    def test_project_confirmation_and_client_binding_fail_before_attempt_is_recorded(self):
+        self.prepare(PROJECT_ID)
+        for confirmed, bound_project in ((False, PROJECT_ID), (True, None),
+                                          (True, "proj_another"), ("true", PROJECT_ID)):
+            self.client.project = bound_project
+            with self.subTest(confirmed=confirmed, bound_project=bound_project), self.assertRaises(pilot.PilotError):
+                pilot.run(self.client, self.run_dir, project_limit_confirmed=confirmed)
+            state = pilot.receipt(self.run_dir)
+            self.assertEqual(state["phase"], "prepared")
+            self.assertEqual(state["submission_attempts"], 0)
+            self.assertNotIn("project_limit_confirmation", state)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_project_confirmation_is_saved_before_single_submission(self):
+        self.prepare(PROJECT_ID)
+        self.client.project = PROJECT_ID
+        self.sessions.spend_control = None
+        original_create = self.sessions.create
+
+        def confirmed_create(**request):
+            state = pilot.receipt(self.run_dir)
+            self.assertEqual(state["phase"], "submitting")
+            self.assertEqual(state["submission_attempts"], 1)
+            confirmation = state["project_limit_confirmation"]
+            self.assertEqual(set(confirmation), {"confirmed_at", "verified_by_api", "project_id", "monthly_limit_cents"})
+            self.assertIs(confirmation["verified_by_api"], False)
+            self.assertEqual(confirmation["project_id"], PROJECT_ID)
+            self.assertEqual(confirmation["monthly_limit_cents"], 300)
+            self.assertIsNotNone(pilot.datetime.fromisoformat(confirmation["confirmed_at"]).tzinfo)
+            self.assertNotIn("spend_control", request)
+            return original_create(**request)
+
+        with patch.object(self.sessions, "create", side_effect=confirmed_create):
+            result = pilot.run(self.client, self.run_dir, project_limit_confirmed=True)
+            self.assertEqual(result["phase"], "completed")
+            self.assertEqual(result["result_status"], "available")
+            with self.assertRaises(pilot.PilotError):
+                pilot.run(self.client, self.run_dir, project_limit_confirmed=True)
+        self.assertEqual(self.sessions.creates, 1)
+
+    def test_project_confirmation_flag_cannot_relabel_a_session_budget(self):
+        self.prepare()
+        self.client.project = PROJECT_ID
+        with self.assertRaisesRegex(pilot.PilotError, "only valid"):
+            pilot.run(self.client, self.run_dir, project_limit_confirmed=True)
+        state = pilot.receipt(self.run_dir)
+        self.assertEqual(state["phase"], "prepared")
+        self.assertEqual(state["submission_attempts"], 0)
+        self.assertNotIn("project_limit_confirmation", state)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_budget_policy_rejects_partial_or_changed_project_protection(self):
+        self.prepare(PROJECT_ID)
+        manifest = pilot.read_json(self.run_dir / "manifest.json")
+        state = pilot.receipt(self.run_dir)
+        request = json.loads((self.run_dir / "request.json").read_text())
+        cases = []
+        for target in ("manifest", "receipt"):
+            changed = deepcopy(manifest if target == "manifest" else state)
+            changed.pop("budget_control")
+            cases.append((f"missing_{target}", changed if target == "manifest" else manifest,
+                          changed if target == "receipt" else state, request))
+        changed = deepcopy(state)
+        changed["budget_control"]["project_id"] = "proj_another"
+        cases.append(("different_project", manifest, changed, request))
+        changed = deepcopy(manifest)
+        changed["budget_control"]["extra"] = True
+        cases.append(("extra_policy_field", changed, state, request))
+        changed = deepcopy(state)
+        changed["spend_limit_cents"] = 299
+        cases.append(("legacy_limit_mismatch", manifest, changed, request))
+        for bad_limit in (True, 0, 301):
+            m, s = deepcopy(manifest), deepcopy(state)
+            m["budget_control"]["monthly_limit_cents"] = s["budget_control"]["monthly_limit_cents"] = bad_limit
+            m["spend_limit_cents"] = s["spend_limit_cents"] = bad_limit
+            cases.append((f"invalid_limit_{bad_limit}", m, s, request))
+        for value in (None, {"limit": 300}):
+            cases.append((f"unexpected_spend_control_{value}", manifest, state, {**request, "spend_control": value}))
+        m, s = deepcopy(manifest), deepcopy(state)
+        m.pop("budget_control")
+        s.pop("budget_control")
+        cases.append(("cannot_downgrade_to_missing_session_limit", m, s, request))
+        self.client.project = PROJECT_ID
+        for name, m, s, packet in cases:
+            with self.subTest(name=name):
+                raw = pilot.encode(packet)
+                m, s = deepcopy(m), deepcopy(s)
+                m["request_sha256"] = s["request_sha256"] = pilot.digest(raw)
+                pilot.atomic_bytes(self.run_dir / "manifest.json", pilot.encode(m))
+                pilot.atomic_bytes(self.run_dir / "receipt.json", pilot.encode(s))
+                pilot.atomic_bytes(self.run_dir / "request.json", raw)
+                with self.assertRaises(pilot.PilotError):
+                    pilot.run(self.client, self.run_dir, project_limit_confirmed=True)
+                self.assertEqual(pilot.receipt(self.run_dir)["submission_attempts"], 0)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_client_for_run_uses_saved_project_and_legacy_signature(self):
+        self.prepare(PROJECT_ID)
+        with patch.object(pilot, "make_client", return_value=self.client) as factory:
+            self.assertIs(pilot.client_for_run(self.run_dir), self.client)
+            factory.assert_called_once_with(project_id=PROJECT_ID)
+        legacy_dir = self.root / "legacy"
+        pilot.prepare(self.skill, self.snapshot, legacy_dir, pilot.DEFAULT_MODEL, False)
+        with patch.object(pilot, "make_client", return_value=self.client) as factory:
+            self.assertIs(pilot.client_for_run(legacy_dir), self.client)
+            factory.assert_called_once_with()
+
+    def test_manifest_identity_mismatch_blocks_submission(self):
+        self.prepare(PROJECT_ID)
+        self.client.project = PROJECT_ID
+        manifest = pilot.read_json(self.run_dir / "manifest.json")
+        for field, value in (("run_id", "different-run"), ("request_sha256", "0" * 64)):
+            changed = {**manifest, field: value}
+            pilot.atomic_bytes(self.run_dir / "manifest.json", pilot.encode(changed))
+            with self.subTest(field=field), self.assertRaises(pilot.PilotError):
+                pilot.run(self.client, self.run_dir, project_limit_confirmed=True)
+            self.assertEqual(pilot.receipt(self.run_dir)["submission_attempts"], 0)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_saved_project_routing_survives_damaged_inputs_without_enabling_run(self):
+        self.prepare(PROJECT_ID)
+        self.client.project = PROJECT_ID
+        pilot.update_receipt(self.run_dir, phase="in_progress", session_id=SID, turn_id=TID)
+        (self.run_dir / "request.json").write_text("damaged input", encoding="utf-8")
+        (self.run_dir / "manifest.json").unlink()
+        with patch.object(pilot, "make_client", return_value=self.client) as factory:
+            client = pilot.client_for_run(self.run_dir)
+            factory.assert_called_once_with(project_id=PROJECT_ID)
+            pilot.request_cancel(client, self.run_dir)
+            with self.assertRaises(pilot.PilotError):
+                pilot.run(client, self.run_dir, project_limit_confirmed=True)
+        self.assertEqual(self.sessions.cancels, 1)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_invalid_saved_project_policy_never_falls_back_to_default_project(self):
+        self.prepare(PROJECT_ID)
+        policy = pilot.receipt(self.run_dir)["budget_control"]
+        pilot.update_receipt(self.run_dir, budget_control={**policy, "monthly_limit_cents": 299})
+        with patch.object(pilot, "make_client") as factory:
+            with self.assertRaises(pilot.PilotError):
+                pilot.client_for_run(self.run_dir)
+            factory.assert_not_called()
+
+    @unittest.skipUnless(HAS_SDK, "Requires the pinned local OpenAI SDK")
+    def test_real_sdk_project_header_and_no_repeated_post(self):
+        import httpx2
+        from openai import OpenAI as SDKOpenAI
+        self.prepare(PROJECT_ID)
+        calls = []
+
+        def respond(request):
+            calls.append(request)
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.url.path, "/v1/agents/sessions")
+            self.assertEqual(request.headers["OpenAI-Project"], PROJECT_ID)
+            self.assertEqual(request.headers["OpenAI-Beta"], "agents=v1")
+            self.assertNotIn("spend_control", json.loads(request.content))
+            state = pilot.receipt(self.run_dir)
+            self.assertEqual(state["submission_attempts"], 1)
+            self.assertIs(state["project_limit_confirmation"]["verified_by_api"], False)
+            return httpx2.Response(400, json={"error": {"message": "Offline transport rejection.",
+                                                        "type": "invalid_request_error", "code": "test_error"}})
+
+        http = httpx2.Client(transport=httpx2.MockTransport(respond), trust_env=False)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-project-test-only", "OPENAI_PROJECT_ID": "proj_wrong_env"}), \
+                patch("openai.OpenAI", side_effect=lambda **kwargs: SDKOpenAI(http_client=http, **kwargs)):
+            with pilot.client_for_run(self.run_dir) as client:
+                self.assertEqual(client.project, PROJECT_ID)
+                self.assertEqual(client.max_retries, 0)
+                with self.assertRaises(pilot.PilotError):
+                    pilot.run(client, self.run_dir, project_limit_confirmed=True)
+                with self.assertRaises(pilot.PilotError):
+                    pilot.run(client, self.run_dir, project_limit_confirmed=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(pilot.receipt(self.run_dir)["phase"], "creation_rejected")
 
     def test_invalid_budget_never_prepares_or_submits(self):
         for limit in (None, 0, -1, True, 10_001):

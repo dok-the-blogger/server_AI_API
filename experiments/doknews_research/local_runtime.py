@@ -245,9 +245,14 @@ def prepare(root: Path = ROOT, runner=None) -> int:
 def forward(command: str, arguments: list[str], root: Path = ROOT) -> int:
     # Validate parser inputs without echoing unknown arguments or credential-like values.
     options = {"--action": str, "--run-dir": str, "--max-seconds": int, "--max-snapshot-hours": float}
-    if len(arguments) % 2 or "--run-dir" not in arguments:
+    values = list(arguments)
+    if values.count("--project-limit-confirmed") > 1:
+        raise RuntimeFailure("Duplicate project-limit confirmation.")
+    if "--project-limit-confirmed" in values:
+        values.remove("--project-limit-confirmed")
+    if len(values) % 2 or "--run-dir" not in values:
         raise RuntimeFailure("Provide the prepared run directory and supported launcher options.")
-    for option, value in zip(arguments[::2], arguments[1::2]):
+    for option, value in zip(values[::2], values[1::2]):
         if option not in options:
             raise RuntimeFailure("Unsupported launcher option.")
         try:
