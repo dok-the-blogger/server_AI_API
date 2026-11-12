@@ -1,0 +1,2 @@
+# Separate environment: do not change the production AI service dependencies.
+openai>=3.13.0,<4
