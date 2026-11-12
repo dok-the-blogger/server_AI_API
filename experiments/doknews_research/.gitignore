@@ -5,6 +5,8 @@
 runs/
 prepared-run/
 bootstrap-diagnostics.json
+runtime-diagnostics.json
+.pilot-packages-*/
 inputs/
 __pycache__/
 *.pyc

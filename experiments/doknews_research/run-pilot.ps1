@@ -47,7 +47,8 @@ function Invoke-PilotProcess {
     $start.RedirectStandardError = [bool]$Quiet
     # Bootstrap processes do not inherit an API key or SDK debug logging.
     foreach ($name in @($start.EnvironmentVariables.Keys)) {
-        if ($name -like 'OPENAI_*' -or $name -in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONINSPECT')) {
+        if ($name -like 'OPENAI_*' -or $name -in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONINSPECT',
+                                                  'PYLAUNCH_DEBUG', 'PYLAUNCHER_DEBUG', '__PYVENV_LAUNCHER__')) {
             $start.EnvironmentVariables.Remove($name)
         }
     }
@@ -87,7 +88,7 @@ function Find-PilotPython {
         if ($command.Source -match '\\Microsoft\\WindowsApps\\') { continue }
         $prefix = @()
         if ($name -eq 'py.exe') { $prefix = @('-3') }
-        $code = Invoke-PilotProcess -Executable $command.Source -Arguments ($prefix + @('-c', $probe)) -Quiet
+        $code = Invoke-PilotProcess -Executable $command.Source -Arguments ($prefix + @('-I', '-S', '-X', 'utf8', '-c', $probe)) -Quiet
         if ($code -eq 0) { return @{ Path = $command.Source; Prefix = $prefix } }
     }
     throw 'PythonUnavailable'
@@ -132,21 +133,19 @@ $key = $null
 try {
     if (-not $RunDir) { $RunDir = Join-Path $PSScriptRoot 'prepared-run' }
     $RunDir = [IO.Path]::GetFullPath($RunDir)
-    $wrapper = Join-Path $PSScriptRoot 'launcher.py'
-    $bootstrap = Join-Path $PSScriptRoot 'bootstrap.py'
+    $runtime = Join-Path $PSScriptRoot 'local_runtime.py'
     $script:Step = 'finding Python 3.11 or newer'
     $python = Find-PilotPython
+    $runtimeCommand = $python.Prefix + @('-I', '-S', '-X', 'utf8', $runtime)
     $common = @('--action', $Action, '--run-dir', $RunDir, '--max-seconds', [string]$MaxSeconds,
                 '--max-snapshot-hours', [string]$MaxSnapshotHours)
     $script:Step = 'checking the prepared packet (offline)'
-    $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($python.Prefix + @($wrapper, 'check') + $common)
+    $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($runtimeCommand + @('check') + $common)
     if ($code -ne 0) { exit $code }
 
-    $venv = Join-Path $PSScriptRoot '.venv'
-    $venvPython = Join-Path $venv 'Scripts\python.exe'
-    $script:Step = 'preparing the isolated Python environment'
-    Write-Host 'Preparing the isolated environment; the API key has not been requested.'
-    $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($python.Prefix + @($bootstrap))
+    $script:Step = 'preparing local Python dependencies'
+    Write-Host 'Preparing local dependencies with the installed Python; the API key has not been requested.'
+    $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($runtimeCommand + @('prepare'))
     if ($code -ne 0) { exit $code }
 
     $script:Step = 'reading the locally selected credential'
@@ -158,7 +157,7 @@ try {
         Write-Host 'Starting one paid research session with the spend threshold shown above (USD cents).'
         Write-Host 'The threshold is not an exact final bill. Closing this window does not prove remote cancellation.'
     }
-    $code = Invoke-PilotProcess -Executable $venvPython -Arguments (@($wrapper, 'execute') + $common) -ApiKey $key
+    $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($runtimeCommand + @('execute') + $common) -ApiKey $key
     $key = $null
     Write-Host 'Finished. Receipt and any completed dossier are in the prepared run directory.'
     exit $code
@@ -167,8 +166,12 @@ try {
     Write-Host ('Pilot stopped while ' + $script:Step + '. No credential details were printed.') -ForegroundColor Red
     if ($script:Step -eq 'finding Python 3.11 or newer') {
         Write-Host 'Install Python 3.11 or newer with the Python launcher, then open START.cmd again.'
+    } elseif ($script:Step -eq 'preparing local Python dependencies') {
+        Write-Host 'Check runtime-diagnostics.json in the pilot folder.'
+    } elseif ($script:Step -eq 'reading the locally selected credential') {
+        Write-Host 'Use -KeyMode Prompt if the file picker is unavailable.'
     } else {
-        Write-Host 'Check Python, network access and the prepared packet. Use -KeyMode Prompt if the file picker is unavailable.'
+        Write-Host 'Check Python, network access and the prepared packet.'
     }
     exit 2
 } finally {
