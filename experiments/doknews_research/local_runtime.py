@@ -254,7 +254,7 @@ def forward(command: str, arguments: list[str], root: Path = ROOT) -> int:
             options[option](value)
         except (TypeError, ValueError):
             raise RuntimeFailure("Invalid launcher option value.") from None
-        if option == "--action" and value not in {"run", "status", "resume", "cancel"}:
+        if option == "--action" and value not in {"run", "status", "resume", "cancel", "inspect"}:
             raise RuntimeFailure("Unsupported pilot action.")
     return local_module("launcher", root).main([command, *arguments])
 

@@ -1,7 +1,7 @@
 # Windows PowerShell 5.1+; credentials are never added to this PowerShell process's environment.
 [CmdletBinding()]
 param(
-    [ValidateSet('run', 'status', 'resume', 'cancel')][string]$Action = 'run',
+    [ValidateSet('run', 'status', 'resume', 'cancel', 'inspect')][string]$Action = 'run',
     [string]$RunDir = '',
     [ValidateSet('File', 'Prompt')][string]$KeyMode = 'File',
     [ValidateRange(30, 3600)][int]$MaxSeconds = 900,
@@ -156,10 +156,18 @@ try {
     if ($Action -eq 'run') {
         Write-Host 'Starting one paid research session with the spend threshold shown above (USD cents).'
         Write-Host 'The threshold is not an exact final bill. Closing this window does not prove remote cancellation.'
+    } elseif ($Action -eq 'inspect') {
+        Write-Host 'Inspecting saved attempt with GET requests only; no new research will be submitted.'
     }
     $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($runtimeCommand + @('execute') + $common) -ApiKey $key
     $key = $null
-    Write-Host 'Finished. Receipt and any completed dossier are in the prepared run directory.'
+    if ($Action -eq 'inspect') {
+        Write-Host ('Inspection process exited with code ' + $code + '. Saved reports are identified above.')
+    } elseif ($code -eq 0) {
+        Write-Host 'Finished. Receipt and any completed dossier are in the prepared run directory.'
+    } else {
+        Write-Host 'The operation stopped with an error. Check receipt.json before any new attempt.'
+    }
     exit $code
 } catch {
     # Deliberately omit exception text, selected filenames, process arguments and credential data.

@@ -239,11 +239,92 @@ def as_dict(value) -> dict:
 
 
 def safe_error(exc: Exception) -> dict:
-    result = {"type": type(exc).__name__}
-    code = getattr(exc, "status_code", None)
-    if isinstance(code, int):
-        result["http_status"] = code
+    """Allowlisted SDK diagnostics, never an exception/request/body serialization."""
+    result = {"type": "Exception"}
+    try:
+        from bootstrap import redact
+
+        def clean(value, limit):
+            if type(value) is not str or len(value) > 1_000_000:
+                return None
+            key = os.environ.get("OPENAI_API_KEY", "")
+            for secret in sorted({key, key.strip()}, key=len, reverse=True):
+                if secret:
+                    value = value.replace(secret, "[REDACTED_KEY]")
+            # Redact the complete value before truncating, including identifiers.
+            value = redact(value)
+            value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value)
+            return value[:limit]
+
+        def identifier(value, limit, pattern):
+            if type(value) is not str or len(value) > limit:
+                return None
+            value = clean(value, limit)
+            return value if value and re.fullmatch(pattern, value) else None
+
+        result["type"] = identifier(type(exc).__name__, 100, r"[A-Za-z_][A-Za-z0-9_]*") or "Exception"
+        status = getattr(exc, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            result["http_status"] = status
+        from openai import APIError, APIStatusError
+        if not isinstance(exc, APIError):
+            return result
+        request_id = identifier(getattr(exc, "request_id", None), 200, r"[A-Za-z0-9][A-Za-z0-9_.:-]*")
+        if request_id:
+            result["request_id"] = request_id
+        if isinstance(exc, APIStatusError):
+            content_type = exc.response.headers.get("content-type", "").split(";", 1)[0].strip()
+            content_type = identifier(content_type, 100, r"[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+")
+            if content_type:
+                result["content_type"] = content_type
+        body = exc.body
+        error = None
+        if type(body) is dict:
+            candidate = body.get("error", body)
+            if type(candidate) is dict and any(name in candidate for name in ("message", "code", "type", "param")):
+                error = candidate
+            result["body_format"] = "error_object" if error is not None else "json_object"
+        elif type(body) is str:
+            result["body_format"] = "html" if body.lstrip().startswith("<") else "text"
+        else:
+            result["body_format"] = "none" if body is None else "json_array" if type(body) is list else "other"
+        fields = {}
+        if error is not None:
+            for name, limit, pattern in (
+                ("code", 128, r"[A-Za-z_][A-Za-z0-9_.:-]*"),
+                ("type", 128, r"[A-Za-z_][A-Za-z0-9_.:-]*"),
+                ("param", 256, r"[A-Za-z0-9_][A-Za-z0-9_.\[\]/-]*"),
+            ):
+                value = identifier(error.get(name), limit, pattern)
+                if value:
+                    fields[name] = value
+            message = clean(error.get("message"), 2000)
+            if message:
+                fields["message"] = message
+        elif body is None:
+            # SDK status messages often contain a stringified body. Only a plain
+            # message with no body is eligible for this conservative fallback.
+            message = getattr(exc, "message", None)
+            if (type(message) is str and not message.lstrip().startswith(("Error code:", "{", "[", "<"))
+                    and "\n" not in message and "\r" not in message):
+                message = clean(message, 2000)
+                if message:
+                    fields["message"] = message
+        if fields:
+            result["error"] = fields
+    except Exception:
+        # Diagnostics must not replace the error being diagnosed.
+        pass
     return result
+
+
+def is_http_400(exc: Exception) -> bool:
+    try:
+        from openai import APIStatusError
+        return (isinstance(exc, APIStatusError) and exc.status_code == 400
+                and exc.response.status_code == 400)
+    except Exception:
+        return False
 
 
 def failure_code(value):
@@ -336,7 +417,7 @@ def fetch_pages(fetch, **kwargs):
 def recover(client, run_dir: Path):
     """One read-only reconciliation. Does not reconnect a stream or submit any input."""
     state = receipt(run_dir)
-    if state["phase"] == "prepared" or state.get("session_deleted"):
+    if state["phase"] in {"prepared", "creation_rejected"} or state.get("session_deleted"):
         return state
     session_id = state.get("session_id")
     if not session_id:
@@ -427,12 +508,21 @@ def run(client, run_dir: Path, max_seconds: int = 900):
                 or spend_limit != state.get("spend_limit_cents")):
             raise PilotError("Prepared run has no matching session spend limit; prepare a new bounded run.")
         # Persist BEFORE the potentially billable POST. A crash never enables automatic replay.
-        state.update(phase="submitting", submitted_at=now(),
+        state.update(phase="submitting", submitted_at=now(), api_stage="create_request",
                      deadline_epoch=time.time() + max_seconds, submission_attempts=1)
         atomic_bytes(run_dir / "receipt.json", encode(state))
     timer = None
+    created_stream = None
+    create_accepted = False
+    api_stage = "create_request"
     try:
-        with client.beta.agents.sessions.create(**request, stream=True).with_result_collection() as stream:
+        created_stream = client.beta.agents.sessions.create(**request, stream=True)
+        # create() has received a successful HTTP response. Any failure after
+        # this point is not evidence that the server rejected session creation.
+        create_accepted = True
+        api_stage = "observe_stream"
+        state = update_receipt(run_dir, api_stage=api_stage, create_accepted=True)
+        with created_stream.with_result_collection() as stream:
             for event in stream:
                 state = record_event(run_dir, event)
                 # Creation streams may stay open at idle. Only the initial root
@@ -451,32 +541,72 @@ def run(client, run_dir: Path, max_seconds: int = 900):
                     timer.daemon = True
                     timer.start()
             result = stream.get_final_result()
-        update_receipt(run_dir, session_id=result.session_id)
+        api_stage = "recover_saved_output"
+        state = update_receipt(run_dir, session_id=result.session_id, api_stage=api_stage)
         # Reconcile persisted root turn + final items, not intermediate commentary.
         return recover(client, run_dir)
-    except KeyboardInterrupt:
-        if receipt(run_dir).get("session_id"):
-            request_cancel(client, run_dir, "keyboard_interrupt")
-        update_receipt(run_dir, observer_interrupted=True)
-        raise PilotError("Observation interrupted. Cancellation is best effort; use status to verify.")
+    except KeyboardInterrupt as exc:
+        try:
+            if receipt(run_dir).get("session_id"):
+                request_cancel(client, run_dir, "keyboard_interrupt")
+        except Exception:
+            pass
+        try:
+            update_receipt(run_dir, observer_interrupted=True, api_stage=api_stage)
+        except Exception:
+            pass
+        raise PilotError("Observation interrupted. Cancellation is best effort; use status to verify.") from exc
     except Exception as exc:
-        current = receipt(run_dir)
-        changes = {"observer_error": safe_error(exc)}
-        if not current.get("session_id"):
+        current = state
+        try:
+            current = receipt(run_dir)
+        except Exception:
+            pass
+        rejected = api_stage == "create_request" and not create_accepted and is_http_400(exc)
+        changes = {"observer_error": safe_error(exc), "api_stage": api_stage,
+                   "create_accepted": create_accepted}
+        if rejected:
+            changes["phase"] = "creation_rejected"
+        elif not current.get("session_id"):
             changes["phase"] = "creation_unknown"
-        elif current["phase"] not in TERMINAL:
+        elif current.get("phase") not in TERMINAL:
             changes["phase"] = "observation_interrupted"
-        update_receipt(run_dir, **changes)
-        if current.get("session_id") and current["phase"] not in TERMINAL:
+        diagnostic_saved = False
+        try:
+            update_receipt(run_dir, **changes)
+            diagnostic_saved = True
+        except Exception:
+            pass
+        if current.get("session_id") and current.get("phase") not in TERMINAL:
             # The process is about to close the client and its watchdog. Request
             # cancellation now rather than silently leaving an unbounded cloud turn.
-            request_cancel(client, run_dir, "observer_error")
+            try:
+                request_cancel(client, run_dir, "observer_error")
+            except Exception:
+                pass
         if isinstance(exc, PilotError):
             raise
-        raise PilotError("The observer stopped. Saved identifiers may permit status/resume; never repeat run.") from exc
+        diagnostic = ("See receipt.json observer_error." if diagnostic_saved
+                      else "The receipt diagnostic could not be saved.")
+        if rejected:
+            message = "The API rejected session creation (HTTP 400)."
+        elif api_stage == "create_request":
+            message = "Session creation could not be confirmed. Inspect Platform sessions."
+        elif api_stage == "recover_saved_output":
+            message = "Retrieval of saved output failed. Use status/resume with the saved identifiers."
+        else:
+            message = "The observer stopped. Saved identifiers may permit status/resume."
+        raise PilotError(f"{message} {diagnostic} Never repeat run.") from exc
     finally:
         if timer is not None:
             timer.cancel()
+        if created_stream is not None:
+            try:
+                close = getattr(created_stream, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
 
 
 def main(argv=None) -> int:
@@ -518,14 +648,14 @@ def main(argv=None) -> int:
                 else:
                     result = recover(client, args.run_dir)
             print(json.dumps(result, ensure_ascii=False, indent=2))
-            if result.get("phase") in {"failed", "cancelled", "creation_unknown"} or result.get("result_status") == "missing_final":
+            if result.get("phase") in {"failed", "cancelled", "creation_unknown", "creation_rejected"} or result.get("result_status") == "missing_final":
                 return 2
         return 0
     except PilotError as exc:
         print(f"Pilot: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:
-        # SDK/server error bodies and input contents are deliberately not printed.
+        # Only bounded, redacted, allowlisted SDK fields may reach the terminal.
         print(json.dumps({"error": safe_error(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

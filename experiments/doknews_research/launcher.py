@@ -26,6 +26,9 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise pilot.PilotError("Prepared run directory is missing or is a link.")
     state = pilot.receipt(run_dir)
+    if action == "inspect":
+        import inspect_pilot
+        return inspect_pilot.preflight(run_dir)
     if action != "run":
         if not state.get("session_id") or state.get("session_deleted"):
             raise pilot.PilotError("No saved session can be inspected. Check Platform if creation is unknown.")
@@ -99,7 +102,7 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "execute"))
-    parser.add_argument("--action", choices=("run", "status", "resume", "cancel"), default="run")
+    parser.add_argument("--action", choices=("run", "status", "resume", "cancel", "inspect"), default="run")
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--max-snapshot-hours", type=float, default=6)
     parser.add_argument("--max-seconds", type=int, default=900)
@@ -111,6 +114,9 @@ def main(argv=None) -> int:
         if args.command == "check":
             print(json.dumps(result, ensure_ascii=True))
             return 0
+        if args.action == "inspect":
+            import inspect_pilot
+            return inspect_pilot.execute(args.run_dir)
         command = [args.action, "--run-dir", str(args.run_dir)]
         if args.action == "run":
             command += ["--max-seconds", str(args.max_seconds)]
