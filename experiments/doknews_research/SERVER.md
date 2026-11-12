@@ -125,9 +125,11 @@ Git, snapshot, конфигурационный JSON или журналы.
 окружения worker; для неё `openai_key_file` должен быть `null`. Пример конфигурации
 использует файл, чтобы не добавлять ключ в окружение основного AI-процесса.
 
-`AI_API_API_TOKEN` — отдельный существующий Bearer token ai-service. Он требуется
-для research HTTP и не заменяется ключом OpenAI. Его согласованная копия у
-DOK Agents — `DOK_AGENTS_EMBEDDINGS_API_TOKEN`; адрес берётся из существующего
+`AI_API_RESEARCH_API_TOKEN` — отдельный Bearer token для research HTTP. При его
+отсутствии сохраняется совместимый fallback к `AI_API_API_TOKEN`. Для изолированной
+настройки research не нужно менять авторизацию других маршрутов ai-service.
+Согласованная копия у DOK Agents — `DOK_AGENTS_RESEARCH_API_TOKEN` (fallback к
+`DOK_AGENTS_EMBEDDINGS_API_TOKEN`). Эти токены не заменяют ключ OpenAI; адрес берётся из существующего
 `DOK_AGENTS_EMBEDDINGS_BASE_URL` (loopback, обычно `http://127.0.0.1:9000`).
 Инструменты появляются при включённых `DOK_AGENTS_ENABLED` и
 `DOK_AGENTS_EMBEDDINGS_ENABLED` после выпуска кода dok-agents и обновления
@@ -152,16 +154,18 @@ sudo -u ai-service /opt/doknews-research/venv/bin/python -I -X utf8 /opt/ai-serv
 доступность модели, действительность ключа на стороне OpenAI или наличие кредитов.
 `worker --once` для такой проверки не подходит: он может исполнить queued job.
 
-В управляемую конфигурацию действующего unit добавить только путь:
+В существующий runtime-файл `/opt/ai-service/.env` добавить путь и отдельный
+служебный research token; установщик сохраняет остальные значения и права файла.
+Форма записи пути:
 
-```ini
-[Service]
-Environment="AI_API_RESEARCH_CONFIG_PATH=/etc/doknews-research/config.json"
+```dotenv
+AI_API_RESEARCH_CONFIG_PATH=/etc/doknews-research/config.json
 ```
 
-Существующие `ExecStart`, пользователь, остальные environment files и токены
-сохраняются. После согласованной установки unit/config выполняется штатный
-daemon-reload/restart. С `api_enabled=false` подключены только чтения сохранённых
+Для ai-service не создаётся systemd drop-in: установленный Deploy-контракт
+требует пустой `DropInPaths`. `ExecStart`, пользователь и unit сохраняются.
+После согласованной установки runtime-конфигурации выполняется штатный restart.
+С `api_enabled=false` подключены только чтения сохранённых
 работ; новый платный worker не запускается. Без пути research вообще отключён.
 
 Для первого живого прохода после успешного check установить `api_enabled=true`
