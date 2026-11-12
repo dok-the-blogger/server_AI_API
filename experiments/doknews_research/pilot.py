@@ -166,17 +166,23 @@ def validate_snapshot(value: dict):
 
 
 def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
-            include_ai_guide: bool, spend_limit_cents: int = DEFAULT_SPEND_LIMIT_CENTS,
-            project_id: str | None = None):
-    if type(spend_limit_cents) is not int or not 1 <= spend_limit_cents <= 10_000:
+            include_ai_guide: bool, spend_limit_cents: int | None = DEFAULT_SPEND_LIMIT_CENTS,
+            project_id: str | None = None, no_spend_limit: bool = False):
+    if type(no_spend_limit) is not bool:
+        raise PilotError("--no-spend-limit must be an explicit boolean selection.")
+    if no_spend_limit and project_id is not None:
+        raise PilotError("--no-spend-limit and --project-id cannot be used together.")
+    if no_spend_limit:
+        spend_limit_cents = None
+    elif type(spend_limit_cents) is not int or not 1 <= spend_limit_cents <= 10_000:
         raise PilotError("Pilot spend limit must be from 1 to 10000 USD cents.")
-    project_budget = None
+    budget_control = {"kind": "unlimited"} if no_spend_limit else None
     if project_id is not None:
         if type(project_id) is not str or not PROJECT_ID_PATTERN.fullmatch(project_id):
             raise PilotError("Expected an explicit project ID beginning with proj_.")
         if spend_limit_cents > 300:
             raise PilotError("This pilot's project monthly hard limit must be from 1 to 300 USD cents.")
-        project_budget = {"kind": "project_hard_limit", "project_id": project_id,
+        budget_control = {"kind": "project_hard_limit", "project_id": project_id,
                           "monthly_limit_cents": spend_limit_cents}
     snapshot = read_json(snapshot_path)
     validate_snapshot(snapshot)
@@ -209,9 +215,8 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
             + json.dumps(snapshot, ensure_ascii=False)
         ),
     }
-    if project_budget is not None:
-        # This is a separate, explicitly selected budget mode. The operator must
-        # confirm the external monthly project hard limit before submission.
+    if budget_control is not None:
+        # No session limit is sent for these explicitly selected modes.
         del request["spend_control"]
     request_bytes = encode(request)
     if len(request_bytes) > MAX_REQUEST_BYTES:
@@ -234,8 +239,8 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
         "ai_guide_included": include_ai_guide,
         "spend_limit_cents": spend_limit_cents,
     }
-    if project_budget is not None:
-        manifest["budget_control"] = project_budget
+    if budget_control is not None:
+        manifest["budget_control"] = budget_control
     atomic_bytes(run_dir / "request.json", request_bytes)
     atomic_bytes(run_dir / "manifest.json", encode(manifest))
     state = {
@@ -245,8 +250,8 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str,
         "submission_attempts": 0,
         "spend_limit_cents": spend_limit_cents,
     }
-    if project_budget is not None:
-        state["budget_control"] = project_budget
+    if budget_control is not None:
+        state["budget_control"] = budget_control
     atomic_bytes(run_dir / "receipt.json", encode(state))
     return manifest
 
@@ -262,6 +267,14 @@ def _checked_project_budget(policy, legacy_limit) -> dict:
             or type(legacy_limit) is not int or legacy_limit != limit):
         raise PilotError("Invalid or inconsistent project monthly hard-limit policy.")
     return dict(policy)
+
+
+def _checked_unlimited_budget(record: dict) -> dict:
+    policy = record.get("budget_control")
+    if (type(policy) is not dict or policy != {"kind": "unlimited"}
+            or "spend_limit_cents" not in record or record["spend_limit_cents"] is not None):
+        raise PilotError("Invalid explicit unlimited budget policy.")
+    return {"kind": "unlimited"}
 
 
 def budget_policy(run_dir: Path, request: dict | None = None) -> dict:
@@ -289,12 +302,17 @@ def budget_policy(run_dir: Path, request: dict | None = None) -> dict:
     if type(request) is not dict:
         raise PilotError("Prepared request must be an object.")
     if "budget_control" in manifest or "budget_control" in state:
-        policy = _checked_project_budget(manifest.get("budget_control"), manifest.get("spend_limit_cents"))
-        saved_policy = _checked_project_budget(state.get("budget_control"), state.get("spend_limit_cents"))
+        values = (manifest.get("budget_control"), state.get("budget_control"))
+        if any(type(value) is dict and value.get("kind") == "unlimited" for value in values):
+            policy = _checked_unlimited_budget(manifest)
+            saved_policy = _checked_unlimited_budget(state)
+        else:
+            policy = _checked_project_budget(values[0], manifest.get("spend_limit_cents"))
+            saved_policy = _checked_project_budget(values[1], state.get("spend_limit_cents"))
         if policy != saved_policy:
-            raise PilotError("Project budget policy does not match the manifest and receipt.")
+            raise PilotError("Budget policy does not match the manifest and receipt.")
         if "spend_control" in request:
-            raise PilotError("A project hard-limit request must not contain session spend_control.")
+            raise PilotError("This budget mode must not contain session spend_control.")
         return policy
     spend = request.get("spend_control")
     limit = spend.get("limit") if type(spend) is dict else None
@@ -434,7 +452,11 @@ def client_for_run(run_dir: Path):
     """
     state = receipt(run_dir)
     if "budget_control" in state:
-        policy = _checked_project_budget(state["budget_control"], state.get("spend_limit_cents"))
+        policy = state["budget_control"]
+        if type(policy) is dict and policy.get("kind") == "unlimited":
+            _checked_unlimited_budget(state)
+            return make_client()
+        policy = _checked_project_budget(policy, state.get("spend_limit_cents"))
         return make_client(project_id=policy["project_id"])
     return make_client()
 
@@ -446,12 +468,16 @@ def record_event(run_dir: Path, event):
     session_id = value.get("session_id") or session.get("id")
     if session_id:
         changes["session_id"] = session_id
+    if session.get("usage") is not None:
+        changes.update(session_usage=session["usage"], latest_session_usage_unknown=False,
+                       session_usage_scope="session", session_usage_is_provisional=True)
     turn = value.get("turn") or {}
     if turn and turn.get("subagent_id") is None and turn.get("id"):
         changes["turn_id"] = turn["id"]
         usage = turn.get("usage") if turn.get("usage") is not None else value.get("usage")
         if usage is not None:
             changes["usage"] = usage
+            changes.update(usage_scope="root_turn", usage_is_provisional=True)
         if turn.get("status") in TERMINAL:
             changes["phase"] = turn["status"]
             changes["failure_code"] = failure_code(turn.get("error"))
@@ -515,6 +541,7 @@ def recover(client, run_dir: Path):
         raise PilotError("Creation outcome is unknown. Inspect Platform sessions before any new run.")
     sessions = client.beta.agents.sessions
     session = as_dict(sessions.retrieve(session_id))
+    session_usage = session.get("usage")
     spend = session.get("spend_control")
     safe_spend = None
     if isinstance(spend, dict) and type(spend.get("limit")) is int:
@@ -530,7 +557,10 @@ def recover(client, run_dir: Path):
                    requires_action=bool(session.get("required_actions")),
                    spend_control=safe_spend if safe_spend is not None else state.get("spend_control"),
                    latest_spend_unknown=latest_spend_unknown,
-                   spend_is_provisional=True)
+                   spend_is_provisional=True,
+                   session_usage=session_usage if session_usage is not None else state.get("session_usage"),
+                   latest_session_usage_unknown=session_usage is None,
+                   session_usage_scope="session", session_usage_is_provisional=True)
     if not state.get("turn_id"):
         roots = [t for t in fetch_pages(sessions.turns.list, session_id=session_id,
                                         order="asc", limit=100) if t.get("subagent_id") is None]
@@ -551,7 +581,7 @@ def recover(client, run_dir: Path):
     state = update_receipt(run_dir, phase=phase,
                            usage=latest_usage if latest_usage is not None else receipt(run_dir).get("usage"),
                            latest_usage_unknown=latest_usage is None,
-                           usage_is_provisional=True,
+                           usage_scope="root_turn", usage_is_provisional=True,
                            failure_code=failure_code(turn.get("error")),
                            cancel_confirmed=phase == "cancelled")
     if phase != "completed":
@@ -722,6 +752,8 @@ def main(argv=None) -> int:
     prep.add_argument("--spend-limit-cents", type=int, default=DEFAULT_SPEND_LIMIT_CENTS,
                       help="Session limit, or project monthly hard limit with --project-id, in USD cents (default: 300)")
     prep.add_argument("--project-id", help="Select externally configured project monthly hard-limit mode (maximum 300 cents)")
+    prep.add_argument("--no-spend-limit", action="store_true",
+                      help="Explicitly prepare this pilot without a session or project monetary limit")
     for name in ("run", "status", "resume", "cancel", "close"):
         command = commands.add_parser(name)
         command.add_argument("--run-dir", type=Path, required=True)
@@ -733,7 +765,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "prepare":
             result = prepare(args.skill_dir, args.snapshot, args.run_dir, args.model,
-                             args.include_ai_guide, args.spend_limit_cents, args.project_id)
+                             args.include_ai_guide, args.spend_limit_cents, args.project_id, args.no_spend_limit)
             summary = {"phase": "prepared", "run_id": result["run_id"],
                        "request_bytes": result["request_bytes"], "request_sha256": result["request_sha256"]}
             if "budget_control" in result:

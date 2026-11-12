@@ -160,9 +160,9 @@ try {
             Write-Host 'Starting one paid research session using the operator-confirmed project MONTHLY hard limit.'
             Write-Host 'The request has no session spend_control. This program has not verified the project setting through the API.'
         } else {
-            Write-Host 'Starting one paid research session with the spend threshold shown above (USD cents).'
+            Write-Host 'Starting one paid research session using the budget mode shown above.'
         }
-        Write-Host 'The threshold is not an exact final bill. Closing this window does not prove remote cancellation.'
+        Write-Host 'Usage will be saved in receipt.json. Closing this window does not prove remote cancellation.'
     } elseif ($Action -eq 'inspect') {
         Write-Host 'Inspecting saved attempt with GET requests only; no new research will be submitted.'
     }

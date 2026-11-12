@@ -24,12 +24,12 @@ class LauncherPreflightTests(unittest.TestCase):
         self.current = datetime.now(timezone.utc)
         self.run_dir = self.base / "prepared-run"
 
-    def prepare(self, age_hours=0.1, limit=300, project_id=None):
+    def prepare(self, age_hours=0.1, limit=300, project_id=None, no_spend_limit=False):
         self.snapshot["captured_at"] = (self.current - timedelta(hours=age_hours)).isoformat()
         path = self.base / "snapshot.json"
         path.write_bytes(pilot.encode(self.snapshot))
         return pilot.prepare(self.skill, path, self.run_dir, pilot.DEFAULT_MODEL, False, limit,
-                             project_id=project_id)
+                             project_id=project_id, no_spend_limit=no_spend_limit)
 
     def test_fresh_packet_displays_reviewed_threshold(self):
         self.prepare()
@@ -96,6 +96,18 @@ class LauncherPreflightTests(unittest.TestCase):
             launcher.preflight(self.run_dir, "run", project_limit_confirmed=True)
         with self.assertRaises(pilot.PilotError):
             launcher.preflight(self.run_dir, "inspect", project_limit_confirmed=True)
+
+    def test_explicit_unlimited_packet_runs_without_project_confirmation(self):
+        self.prepare(no_spend_limit=True)
+        result = launcher.preflight(self.run_dir, "run", current_time=self.current)
+        self.assertEqual(result["budget_mode"], "unlimited")
+        self.assertIsNone(result["spend_limit_cents"])
+        self.assertNotIn("project_id", result)
+        with patch.object(pilot, "main", return_value=0) as execute:
+            self.assertEqual(launcher.main(["execute", "--run-dir", str(self.run_dir)]), 0)
+        self.assertNotIn("--project-limit-confirmed", execute.call_args.args[0])
+        with self.assertRaises(pilot.PilotError):
+            launcher.preflight(self.run_dir, "run", project_limit_confirmed=True)
 
 
 if __name__ == "__main__":

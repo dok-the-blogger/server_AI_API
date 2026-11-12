@@ -56,15 +56,16 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
     request = json.loads(raw)
     budget = pilot.budget_policy(run_dir, request)
     project_budget = budget["kind"] == "project_hard_limit"
+    unlimited_budget = budget["kind"] == "unlimited"
     if project_budget and project_limit_confirmed is not True:
         raise pilot.PilotError(
             "Confirm the configured hard monthly limit for this exact Platform project before running. "
             "The pilot cannot verify that setting with its ordinary API key.")
     if not project_budget and project_limit_confirmed:
-        raise pilot.PilotError("This packet uses a session limit, not a project-limit confirmation.")
+        raise pilot.PilotError("Project-limit confirmation is only valid for a project-limit packet.")
     # This launcher accepts only the small research-only configuration we prepared.
     expected_keys = {"agent", "environment", "input", "metadata"}
-    if not project_budget:
+    if budget["kind"] == "session":
         expected_keys.add("spend_control")
     if set(request) != expected_keys:
         raise pilot.PilotError("Unexpected session configuration; prepare a supported research packet.")
@@ -76,10 +77,12 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
             or request.get("environment") != {"type": "openai_hosted"}
             or agent.get("model") != manifest.get("model")):
         raise pilot.PilotError("Packet configuration differs from the reviewed web-research pilot.")
-    limit = budget["monthly_limit_cents"] if project_budget else budget["limit_cents"]
-    if (type(limit) is not int or not 1 <= limit <= 300
-            or limit != manifest.get("spend_limit_cents") or limit != state.get("spend_limit_cents")):
-        raise pilot.PilotError("Spend threshold must match the prepared packet and be at most 300 USD cents.")
+    limit = None
+    if not unlimited_budget:
+        limit = budget["monthly_limit_cents"] if project_budget else budget["limit_cents"]
+        if (type(limit) is not int or not 1 <= limit <= 300
+                or limit != manifest.get("spend_limit_cents") or limit != state.get("spend_limit_cents")):
+            raise pilot.PilotError("Spend threshold must match the prepared packet and be at most 300 USD cents.")
     if request.get("metadata") != {"dok_research_run_id": state["run_id"],
                                    "purpose": "doknews_manual_research_pilot"}:
         raise pilot.PilotError("Session metadata does not match this research run.")
@@ -108,7 +111,9 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
     result = {"action": "run", "phase": "prepared", "run_id": state["run_id"],
               "model": agent["model"], "snapshot_age_minutes": round(max(0, age) / 60, 1),
               "new_research": True}
-    if project_budget:
+    if unlimited_budget:
+        result.update(budget_mode="unlimited", spend_limit_cents=None)
+    elif project_budget:
         result.update(project_id=budget["project_id"], project_monthly_limit_cents=limit,
                       project_limit_confirmed_by_operator=True, project_limit_verified_by_api=False)
     else:

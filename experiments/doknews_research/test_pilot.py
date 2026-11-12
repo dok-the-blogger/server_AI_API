@@ -73,6 +73,7 @@ class FakeSessions:
         self.disconnect = False
         self.fail_create = False
         self.spend_control = {"limit": 300, "consumed": 12}
+        self.session_usage = None
         self.item_calls = []
         self.item_pages = {None: {"data": [message()], "has_more": False, "last_id": None}}
         self.events = SimpleNamespace(create=self.cancel)
@@ -94,7 +95,7 @@ class FakeSessions:
     def retrieve(self, session_id):
         assert session_id == SID
         return {"id": SID, "status": "idle", "required_actions": [],
-                "spend_control": self.spend_control}
+                "spend_control": self.spend_control, "usage": self.session_usage}
 
     def get_turn(self, *, turn_id, session_id):
         assert (turn_id, session_id) == (TID, SID)
@@ -139,9 +140,9 @@ class PilotProtocolTests(unittest.TestCase):
     def write_snapshot(self):
         self.snapshot.write_text(json.dumps(self.sample), encoding="utf-8")
 
-    def prepare(self, project_id=None, spend_limit_cents=300):
+    def prepare(self, project_id=None, spend_limit_cents=300, no_spend_limit=False):
         return pilot.prepare(self.skill, self.snapshot, self.run_dir, pilot.DEFAULT_MODEL,
-                             False, spend_limit_cents, project_id)
+                             False, spend_limit_cents, project_id, no_spend_limit)
 
     def mark_submitted(self, phase="in_progress"):
         self.prepare()
@@ -160,6 +161,106 @@ class PilotProtocolTests(unittest.TestCase):
         self.assertNotIn("budget_control", manifest)
         self.assertNotIn("budget_control", pilot.receipt(self.run_dir))
         self.assertEqual(pilot.budget_policy(self.run_dir), {"kind": "session", "limit_cents": 300})
+
+    def test_unlimited_requires_explicit_selection_and_preserves_no_fictional_limit(self):
+        manifest = self.prepare(no_spend_limit=True)
+        state = pilot.receipt(self.run_dir)
+        request = json.loads((self.run_dir / "request.json").read_text())
+        self.assertEqual(manifest["budget_control"], {"kind": "unlimited"})
+        self.assertEqual(state["budget_control"], {"kind": "unlimited"})
+        self.assertIsNone(manifest["spend_limit_cents"])
+        self.assertIsNone(state["spend_limit_cents"])
+        self.assertNotIn("spend_control", request)
+        self.assertEqual(pilot.budget_policy(self.run_dir), {"kind": "unlimited"})
+        self.assertNotIn("project_limit_confirmation", state)
+        with patch.object(pilot, "make_client", return_value=self.client) as factory:
+            self.assertIs(pilot.client_for_run(self.run_dir), self.client)
+            factory.assert_called_once_with()
+
+    def test_unlimited_cannot_be_combined_with_project_or_implicitly_selected(self):
+        for kwargs in ({"project_id": PROJECT_ID, "no_spend_limit": True},
+                       {"no_spend_limit": "true"}, {"spend_limit_cents": None}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(pilot.PilotError):
+                self.prepare(**kwargs)
+            self.assertFalse(self.run_dir.exists())
+
+    def test_unlimited_single_submission_needs_no_project_or_new_confirmation(self):
+        self.prepare(no_spend_limit=True)
+        self.sessions.spend_control = None
+        with self.assertRaises(pilot.PilotError):
+            pilot.run(self.client, self.run_dir, project_limit_confirmed=True)
+        self.assertEqual(pilot.receipt(self.run_dir)["submission_attempts"], 0)
+        self.assertFalse(hasattr(self.client, "project"))
+        result = pilot.run(self.client, self.run_dir)
+        self.assertEqual(result["phase"], "completed")
+        self.assertEqual(result["result_status"], "available")
+        self.assertEqual(result["budget_control"], {"kind": "unlimited"})
+        self.assertIsNone(result["spend_limit_cents"])
+        self.assertIsNone(result["spend_control"])
+        self.assertNotIn("spend_control", self.sessions.request)
+        self.assertNotIn("project", self.sessions.request)
+        self.assertNotIn("project_limit_confirmation", result)
+        with self.assertRaises(pilot.PilotError):
+            pilot.run(self.client, self.run_dir)
+        self.assertEqual(self.sessions.creates, 1)
+
+    def test_unlimited_policy_must_be_exact_consistent_and_without_session_field(self):
+        self.prepare(no_spend_limit=True)
+        manifest = pilot.read_json(self.run_dir / "manifest.json")
+        state = pilot.receipt(self.run_dir)
+        request = json.loads((self.run_dir / "request.json").read_text())
+        cases = []
+        for target in ("manifest", "receipt"):
+            for field, value in (("budget_control", {"kind": "unlimited", "extra": True}),
+                                 ("budget_control", {"kind": "project_hard_limit", "project_id": PROJECT_ID,
+                                                      "monthly_limit_cents": 300}),
+                                 ("spend_limit_cents", 300)):
+                m, s = deepcopy(manifest), deepcopy(state)
+                (m if target == "manifest" else s)[field] = value
+                cases.append((f"{target}_{field}_{value}", m, s, request))
+            for field in ("budget_control", "spend_limit_cents"):
+                m, s = deepcopy(manifest), deepcopy(state)
+                (m if target == "manifest" else s).pop(field)
+                cases.append((f"missing_{target}_{field}", m, s, request))
+        for value in (None, {"limit": 300}):
+            cases.append((f"spend_control_{value}", manifest, state, {**request, "spend_control": value}))
+        for name, m, s, packet in cases:
+            with self.subTest(name=name):
+                raw = pilot.encode(packet)
+                m, s = deepcopy(m), deepcopy(s)
+                m["request_sha256"] = s["request_sha256"] = pilot.digest(raw)
+                pilot.atomic_bytes(self.run_dir / "manifest.json", pilot.encode(m))
+                pilot.atomic_bytes(self.run_dir / "receipt.json", pilot.encode(s))
+                pilot.atomic_bytes(self.run_dir / "request.json", raw)
+                with self.assertRaises(pilot.PilotError):
+                    pilot.run(self.client, self.run_dir)
+                self.assertEqual(pilot.receipt(self.run_dir)["submission_attempts"], 0)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_session_usage_is_separate_provisional_and_missing_does_not_mean_zero(self):
+        self.prepare(no_spend_limit=True)
+        pilot.update_receipt(self.run_dir, phase="in_progress", session_id=SID, turn_id=TID)
+        self.sessions.status = "in_progress"
+        first = pilot.recover(self.client, self.run_dir)
+        self.assertIsNone(first["session_usage"])
+        self.assertTrue(first["latest_session_usage_unknown"])
+        self.sessions.session_usage = {"input_tokens": 500, "output_tokens": 55, "total_tokens": 555}
+        known = pilot.recover(self.client, self.run_dir)
+        self.assertEqual(known["session_usage"], self.sessions.session_usage)
+        self.assertEqual(known["usage"], turn("in_progress")["usage"])
+        self.assertEqual(known["session_usage_scope"], "session")
+        self.assertEqual(known["usage_scope"], "root_turn")
+        self.assertTrue(known["session_usage_is_provisional"])
+        self.assertTrue(known["usage_is_provisional"])
+        self.assertFalse(known["latest_session_usage_unknown"])
+        event_usage = {"input_tokens": 600, "output_tokens": 66, "total_tokens": 666}
+        pilot.record_event(self.run_dir, {"type": "agent.session.idle", "session":
+                                          {"id": SID, "usage": event_usage}})
+        self.sessions.session_usage = None
+        missing = pilot.recover(self.client, self.run_dir)
+        self.assertEqual(missing["session_usage"], event_usage)
+        self.assertTrue(missing["latest_session_usage_unknown"])
+        self.assertEqual(missing["usage"], known["usage"])
 
     def test_project_budget_is_explicit_and_preserved_without_session_spend_control(self):
         manifest = self.prepare(PROJECT_ID)
