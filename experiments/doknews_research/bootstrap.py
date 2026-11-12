@@ -39,7 +39,8 @@ def redact(text: str) -> str:
 
 def child_environment(source: dict[str, str] | None = None) -> dict[str, str]:
     source = os.environ if source is None else source
-    blocked = {"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT"}
+    blocked = {"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT",
+               "PYLAUNCH_DEBUG", "PYLAUNCHER_DEBUG"}
     env = {key: value for key, value in source.items()
            if not key.upper().startswith("OPENAI_") and key.upper() not in blocked}
     env.update(PYTHONUTF8="1", PYTHONNOUSERSITE="1")
@@ -116,6 +117,55 @@ def run_stage(stage: str, argv: list[str], cwd: Path, env: dict[str, str]) -> di
     return record
 
 
+def path_observation(path: Path) -> dict:
+    """Read metadata for a fixed runtime path; never open its contents."""
+    result = {"path": redact(str(path))}
+    try:
+        result["realpath"] = redact(os.path.realpath(path))
+        metadata = path.stat()
+        result["stat"] = {"size": metadata.st_size, "mtime_ns": metadata.st_mtime_ns,
+                          "file_attributes": getattr(metadata, "st_file_attributes", None),
+                          "reparse_tag": getattr(metadata, "st_reparse_tag", None)}
+    except OSError as exc:
+        result["stat_error"] = {"type": type(exc).__name__,
+                                "winerror": getattr(exc, "winerror", None),
+                                "errno": getattr(exc, "errno", None)}
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            get_attributes = ctypes.WinDLL("kernel32", use_last_error=True).GetFileAttributesW
+            get_attributes.argtypes = [ctypes.c_wchar_p]
+            get_attributes.restype = ctypes.c_uint32
+            ctypes.set_last_error(0)
+            attributes = get_attributes(str(path))
+            winerror = ctypes.get_last_error()
+            result["win32_attributes"] = {
+                "value": None if attributes == 0xFFFFFFFF else attributes,
+                "winerror": winerror if attributes == 0xFFFFFFFF else 0,
+            }
+        except Exception as exc:
+            result["win32_probe_error"] = {"type": type(exc).__name__,
+                                           "winerror": getattr(exc, "winerror", None)}
+    return result
+
+
+def verify_context(root: Path, python: Path) -> dict:
+    """Observe exactly the paths used by the credential-free verification."""
+    return {
+        "base_runtime": {name: redact(str(value)) for name, value in {
+            "version": sys.version.split()[0], "executable": sys.executable,
+            "base_executable": getattr(sys, "_base_executable", ""),
+            "prefix": sys.prefix, "base_prefix": sys.base_prefix,
+        }.items()},
+        "working_directory": redact(str(root)),
+        "paths": {name: path_observation(path) for name, path in {
+            "venv_python": python,
+            "cfg_beside_python": python.parent / "pyvenv.cfg",
+            "cfg_above_scripts": python.parent.parent / "pyvenv.cfg",
+        }.items()},
+    }
+
+
 ISOLATION_PROBE = """import importlib.util,json,os,sys
 norm=lambda p: os.path.normcase(os.path.realpath(p))
 info={'version':sys.version.split()[0], 'executable':sys.executable,
@@ -132,7 +182,8 @@ SDK_PROBE = ('import sys,openai,socksio,importlib.metadata as m; '
 
 def write_diagnostics(root: Path, report: dict) -> bool:
     try:
-        # Only the fixed bootstrap report is saved; never argv, env or a key file.
+        # Only the fixed report is saved, never env or a key file. Redirector
+        # stderr may include this script's static, credential-free probe command.
         (root / DIAGNOSTICS).write_text(json.dumps(report, indent=2, ensure_ascii=True)
                                         + "\n", encoding="utf-8")
         return True
@@ -145,7 +196,7 @@ def bootstrap(root: Path, runner=None) -> int:
     runner = run_stage if runner is None else runner
     venv = root / ".venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    report = {"schema_version": 1, "created_at": datetime.now(timezone.utc).isoformat(),
+    report = {"schema_version": 2, "created_at": datetime.now(timezone.utc).isoformat(),
               "completed": False, "stages": []}
     env = child_environment()
     steps = [
@@ -163,7 +214,18 @@ def bootstrap(root: Path, runner=None) -> int:
                                   "exception": {"type": "LinkedVenvRejected", "winerror": None}})
     else:
         for stage, argv in steps:
-            record = runner(stage, argv, root, env)
+            stage_env = env.copy()
+            if stage == "verify_venv":
+                # CPython 3.12's Windows redirector uses PYLAUNCH_DEBUG (no ER).
+                # Only this key-free probe gets it; install/API processes do not.
+                if sys.platform == "win32":
+                    stage_env["PYLAUNCH_DEBUG"] = "1"
+                try:
+                    report["verify_context"] = verify_context(root, python)
+                except Exception as exc:
+                    report["verify_context_error"] = {"type": type(exc).__name__}
+                write_diagnostics(root, report)
+            record = runner(stage, argv, root, stage_env)
             report["stages"].append(record)
             write_diagnostics(root, report)
             if record["exit_code"] != 0 or record.get("exception"):

@@ -94,6 +94,43 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(saved["completed"])
         self.assertEqual(saved["stages"][-1]["exit_code"], 3)
 
+    def test_redirector_debug_is_limited_to_key_free_verification(self):
+        with patch.object(bootstrap.sys, "platform", "win32"), \
+                patch.object(bootstrap, "verify_context", return_value={}), \
+                patch.dict(os.environ, {"PYLAUNCH_DEBUG": "inherited", "PYLAUNCHER_DEBUG": "inherited"}):
+            self.assertEqual(bootstrap.bootstrap(self.root, self.runner), 0)
+        for stage, _, env in self.calls:
+            self.assertNotIn("PYLAUNCHER_DEBUG", env)
+            if stage == "verify_venv":
+                self.assertEqual(env["PYLAUNCH_DEBUG"], "1")
+            else:
+                self.assertNotIn("PYLAUNCH_DEBUG", env)
+
+    def test_cfg_metadata_is_recorded_without_reading_contents(self):
+        venv = self.root / ".venv"
+        venv.mkdir()
+        cfg = venv / "pyvenv.cfg"
+        cfg.write_text("sentinel-file-content-not-for-log")
+        context = bootstrap.verify_context(self.root, venv / "Scripts" / "python.exe")
+        self.assertEqual(context["paths"]["cfg_above_scripts"]["stat"]["size"], cfg.stat().st_size)
+        self.assertEqual(context["paths"]["cfg_beside_python"]["stat_error"]["errno"], 2)
+        self.assertNotIn("sentinel-file-content-not-for-log", json.dumps(context))
+
+    def test_diagnostic_failure_does_not_mask_redirector_exit_code(self):
+        def fail_redirector(*args):
+            record = self.runner(*args)
+            if record["stage"] == "verify_venv":
+                record.update(exit_code=106, stderr="No pyvenv.cfg file\r\n")
+            return record
+        with patch.object(bootstrap, "verify_context", side_effect=RuntimeError("private detail")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bootstrap.bootstrap(self.root, fail_redirector), 2)
+        saved = json.loads((self.root / bootstrap.DIAGNOSTICS).read_text())
+        self.assertEqual(saved["stages"][-1]["exit_code"], 106)
+        self.assertEqual(saved["verify_context_error"], {"type": "RuntimeError"})
+        self.assertEqual([call[0] for call in self.calls], ["venv_without_pip", "verify_venv"])
+        self.assertNotIn("private detail", json.dumps(saved))
+
     def test_credentials_never_reach_children_but_proxy_is_preserved(self):
         environment = {"OPENAI_API_KEY": "sentinel-key", "openai_admin_key": "sentinel-admin",
                        "OPENAI_LOG": "debug", "OPENAI_FUTURE_SECRET": "sentinel-future",
