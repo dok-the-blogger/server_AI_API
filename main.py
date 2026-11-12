@@ -14,10 +14,16 @@ from summaries import Summaries
 from completion_providers import ChatCompletionsProvider
 from classification import JevClassifier
 from routers.classification import router as classification_router
+from routers.research import router as research_router
+from experiments.doknews_research.server_process import start_research, stop_research
+from experiments.doknews_research.server_config import ResearchError
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_profiles()
+    app.state.research_controller = None
+    app.state.research_worker = None
+    app.state.research_service_token = settings.API_TOKEN
 
     if settings.GROK_API_KEY:
         app.state.xai_client = AsyncOpenAI(
@@ -40,6 +46,12 @@ async def lifespan(app: FastAPI):
     )
 
     try:
+        try:
+            app.state.research_controller, app.state.research_worker = start_research(
+                settings.RESEARCH_CONFIG_PATH, service_token_configured=bool(settings.API_TOKEN))
+        except ResearchError:
+            # Misconfigured research does not disable existing AI routes.
+            pass
         app.state.jev_client = (
             JevClassifier(api_key=settings.DIGITALOCEAN_API_KEY,
                           base_url=settings.JEV_BASE_URL, model=settings.JEV_MODEL,
@@ -68,6 +80,7 @@ async def lifespan(app: FastAPI):
             app.state.gigachat_client = None
             yield
     finally:
+        await stop_research(app.state.research_worker)
         if getattr(app.state, "jev_client", None) is not None:
             await app.state.jev_client.aclose()
         if app.state.embeddings_client is not None:
@@ -82,6 +95,7 @@ app.include_router(embeddings_router)
 app.include_router(summaries_router)
 app.include_router(generation_router)
 app.include_router(classification_router)
+app.include_router(research_router)
 
 @app.get("/health")
 async def health():
@@ -94,3 +108,4 @@ if __name__ == "__main__":
         port=settings.PORT,
         log_level=settings.LOG_LEVEL,
     )
+

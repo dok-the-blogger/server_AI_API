@@ -1,0 +1,4 @@
+# Separate environment: do not change the production AI service dependencies.
+openai==3.49.0
+# Preserve configured SOCKS proxy support; never change the user's proxy settings.
+socksio>=1.0.0,<2
