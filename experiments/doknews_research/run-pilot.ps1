@@ -46,10 +46,10 @@ function Invoke-PilotProcess {
     $start.RedirectStandardOutput = [bool]$Quiet
     $start.RedirectStandardError = [bool]$Quiet
     # Bootstrap processes do not inherit an API key or SDK debug logging.
-    foreach ($name in @('OPENAI_API_KEY', 'OPENAI_ADMIN_KEY', 'OPENAI_BASE_URL',
-                        'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID', 'OPENAI_LOG',
-                        'PYTHONPATH', 'PYTHONHOME')) {
-        $start.EnvironmentVariables.Remove($name)
+    foreach ($name in @($start.EnvironmentVariables.Keys)) {
+        if ($name -like 'OPENAI_*' -or $name -in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONSTARTUP', 'PYTHONINSPECT')) {
+            $start.EnvironmentVariables.Remove($name)
+        }
     }
     $start.EnvironmentVariables['PYTHONUTF8'] = '1'
     $start.EnvironmentVariables['PYTHONNOUSERSITE'] = '1'
@@ -133,7 +133,7 @@ try {
     if (-not $RunDir) { $RunDir = Join-Path $PSScriptRoot 'prepared-run' }
     $RunDir = [IO.Path]::GetFullPath($RunDir)
     $wrapper = Join-Path $PSScriptRoot 'launcher.py'
-    $requirements = Join-Path $PSScriptRoot 'requirements-pilot.txt'
+    $bootstrap = Join-Path $PSScriptRoot 'bootstrap.py'
     $script:Step = 'finding Python 3.11 or newer'
     $python = Find-PilotPython
     $common = @('--action', $Action, '--run-dir', $RunDir, '--max-seconds', [string]$MaxSeconds,
@@ -144,23 +144,10 @@ try {
 
     $venv = Join-Path $PSScriptRoot '.venv'
     $venvPython = Join-Path $venv 'Scripts\python.exe'
-    $script:Step = 'creating the isolated Python environment'
-    if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-        Write-Host 'Preparing the isolated environment; the API key has not been requested.'
-        $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($python.Prefix + @('-m', 'venv', $venv)) -Quiet
-        if ($code -ne 0) { throw 'VenvFailed' }
-    }
-    $script:Step = 'checking the isolated environment'
-    $probe = 'import sys; sys.exit(0 if sys.version_info >= (3,11) and sys.prefix != sys.base_prefix else 1)'
-    if ((Invoke-PilotProcess -Executable $venvPython -Arguments @('-c', $probe) -Quiet) -ne 0) { throw 'InvalidVenv' }
-    $script:Step = 'installing the OpenAI SDK before collecting credentials'
-    # Reconcile all pinned requirements, including SOCKS support for existing VPN settings.
-    Write-Host 'Checking the pilot dependencies. No API key is available to this installer.'
-    $pipArgs = @('-m', 'pip', '--isolated', '--disable-pip-version-check', '--no-input',
-                 'install', '--require-virtualenv', '--index-url', 'https://pypi.org/simple', '-r', $requirements)
-    if ((Invoke-PilotProcess -Executable $venvPython -Arguments $pipArgs -Quiet) -ne 0) { throw 'SdkInstallFailed' }
-    $sdkProbe = 'import sys,openai,socksio,importlib.metadata as m; sys.exit(0 if m.version("openai")=="3.49.0" else 1)'
-    if ((Invoke-PilotProcess -Executable $venvPython -Arguments @('-c', $sdkProbe) -Quiet) -ne 0) { throw 'SdkCheckFailed' }
+    $script:Step = 'preparing the isolated Python environment'
+    Write-Host 'Preparing the isolated environment; the API key has not been requested.'
+    $code = Invoke-PilotProcess -Executable $python.Path -Arguments ($python.Prefix + @($bootstrap))
+    if ($code -ne 0) { exit $code }
 
     $script:Step = 'reading the locally selected credential'
     Write-Host 'The key stays on this computer and is passed only to the child Python process.'

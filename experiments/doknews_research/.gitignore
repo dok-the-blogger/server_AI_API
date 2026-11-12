@@ -4,6 +4,7 @@
 .env.local
 runs/
 prepared-run/
+bootstrap-diagnostics.json
 inputs/
 __pycache__/
 *.pyc
