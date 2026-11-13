@@ -92,7 +92,7 @@ class FakeSessions:
                            "turn_id": TID, "turn": turn(self.status)})
         return FakeStream(events, self.disconnect)
 
-    def retrieve(self, session_id):
+    def retrieve(self, session_id, **kwargs):
         assert session_id == SID
         return {"id": SID, "status": "idle", "required_actions": [],
                 "spend_control": self.spend_control, "usage": self.session_usage}

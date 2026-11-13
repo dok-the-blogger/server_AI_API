@@ -253,6 +253,15 @@ class Ledger:
                 ORDER BY created_at, job_id LIMIT ?""", (limit,)).fetchall()
             return [self._job(row) for row in rows]
 
+    def next_usage_refresh(self, before: str) -> dict | None:
+        """One completed job whose delayed, best-effort usage read is still due."""
+        with self._connect() as db:
+            row = db.execute("""SELECT * FROM jobs WHERE status = 'completed'
+                AND updated_at <= ?
+                AND json_extract(receipt_json, '$.usage_refresh_attempted_at') IS NULL
+                ORDER BY updated_at, job_id LIMIT 1""", (before,)).fetchone()
+            return self._job(row) if row is not None else None
+
     def _plan(self, db, consumer, snapshot, identities, limit):
         selected, selected_ids = [], []
         pending = 0
@@ -402,7 +411,10 @@ class Ledger:
             if job["status"] == "completed":
                 if job["dossier_sha256"] != actual:
                     raise LedgerError("Refusing to replace a completed research dossier.")
-                return job
+                # Late accounting does not change the completion time or signal ledger.
+                db.execute("UPDATE jobs SET receipt_json = ? WHERE job_id = ?",
+                           (saved_receipt, job_id))
+                return self._get(db, job_id)
             finished = _now()
             for identity in job["selected_identities"]:
                 db.execute("""INSERT INTO researched_signals
