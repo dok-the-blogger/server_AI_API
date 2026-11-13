@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import importlib.metadata
 import json
 import os
@@ -208,6 +209,35 @@ def reconcile_job(cfg: ServerConfig, ledger: Ledger, job: dict, *, client_factor
         return ledger.get_job(job["job_id"])
 
 
+def refresh_usage_job(cfg: ServerConfig, ledger: Ledger, job: dict, *, client_factory=None):
+    """One delayed session GET, with no model input, output retrieval, or retry loop."""
+    run_dir = checked_run_path(cfg, job)
+    state = pilot.receipt(run_dir)
+    if (job["status"] != "completed" or not completed(state)
+            or state.get("run_id") != job.get("run_id")):
+        return
+    if not state.get("usage_refresh_attempted_at"):
+        # Persist before GET: even interruption must not create an endless accounting wait.
+        state = pilot.update_receipt(run_dir, usage_refresh_attempted_at=utc_now())
+        if state.get("session_id") and not state.get("session_deleted"):
+            try:
+                factory = client_factory or pilot.client_for_run
+                with factory(run_dir) as client:
+                    session = pilot.as_dict(client.beta.agents.sessions.retrieve(
+                        state["session_id"], timeout=10.0))
+                if session.get("id") != state["session_id"]:
+                    raise pilot.PilotError("Usage session does not match the saved run.")
+                usage = session.get("usage")
+                state = pilot.update_receipt(run_dir,
+                    session_usage=usage if usage is not None else state.get("session_usage"),
+                    latest_session_usage_unknown=usage is None,
+                    session_usage_scope="session", session_usage_is_provisional=True)
+            except Exception:
+                # Accounting is optional. Keep the dossier and last known counters.
+                pass
+    ledger.finish(job["job_id"], state, run_dir / "dossier.md")
+
+
 def worker(cfg: ServerConfig, *, once=False, stop_event=None) -> int:
     stop_requested = stop_event if stop_event is not None else threading.Event()
     ensure_state(cfg)
@@ -236,6 +266,14 @@ def worker(cfg: ServerConfig, *, once=False, stop_event=None) -> int:
                 job = ledger.next_queued()
                 if job is None:
                     heartbeat.update("idle")
+                    before = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+                    try:
+                        due = ledger.next_usage_refresh(before)
+                        if due is not None:
+                            refresh_usage_job(cfg, ledger, due)
+                    except Exception:
+                        # A missing accounting record must not stop the research worker.
+                        pass
                     if once:
                         heartbeat.update("stopped")
                         return 0

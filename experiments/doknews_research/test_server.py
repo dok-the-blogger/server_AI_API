@@ -23,7 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from experiments.doknews_research.server_config import ResearchError, ServerConfig, json_bytes, load_config, utc_now
 from experiments.doknews_research.server_control import Controller
-from experiments.doknews_research.server_runner import execute_job, main as server_main, reconcile_job, worker
+from experiments.doknews_research.server_runner import execute_job, main as server_main, reconcile_job, refresh_usage_job, worker
 from experiments.doknews_research.server_process import start_research
 from experiments.doknews_research import pilot as server_pilot
 from experiments.doknews_research.signal_ledger import LedgerError
@@ -96,6 +96,8 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(status["status"], "completed")
         self.assertTrue(status["new_research_submitted"])
         self.assertEqual(status["receipt"]["phase"], "completed")
+        self.assertEqual(status["receipt"]["usage_status"], "pending")
+        self.assertNotIn("latest_spend_unknown", status["receipt"])
         result = self.http.get(f"/research/jobs/{job['job_id']}/result", headers=self.headers).json()
         self.assertEqual(result["dossier_markdown"], "Проверяемое досье")
         self.assertEqual(result["sha256"], final["dossier_sha256"])
@@ -106,6 +108,72 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(skipped.status_code, 200, skipped.text)
         self.assertEqual(skipped.json()["status"], "no_signals")
         self.assertEqual(skipped.json()["coverage"]["radar"], "partial")
+        self.assertEqual(self.sessions.creates, 1)
+
+    def completed_job(self):
+        job = self.submit().json()
+        return execute_job(self.cfg, self.controller.ledger, job["job_id"], client_factory=self.factory)
+
+    def test_delayed_usage_is_refreshed_once_without_changing_result_or_completion_time(self):
+        job = self.completed_job()
+        ledger = self.controller.ledger
+        self.assertIsNone(ledger.next_usage_refresh("2000-01-01T00:00:00+00:00"))
+        due = ledger.next_usage_refresh(utc_now())
+        self.assertEqual(due["job_id"], job["job_id"])
+        self.sessions.session_usage = {"input_tokens": 500, "output_tokens": 55, "total_tokens": 555}
+        with patch.object(self.sessions, "retrieve", wraps=self.sessions.retrieve) as get:
+            refresh_usage_job(self.cfg, ledger, due, client_factory=self.factory)
+            refresh_usage_job(self.cfg, ledger, due, client_factory=self.factory)
+            self.assertEqual(get.call_count, 1)
+            self.assertEqual(get.call_args.kwargs, {"timeout": 10.0})
+        saved = ledger.get_job(job["job_id"])
+        self.assertEqual(saved["updated_at"], job["updated_at"])
+        self.assertEqual(saved["dossier_sha256"], job["dossier_sha256"])
+        self.assertEqual(self.controller.result(job["job_id"])["dossier_markdown"], "Проверяемое досье")
+        receipt = self.controller.status(job["job_id"])["receipt"]
+        self.assertEqual(receipt["usage_status"], "available")
+        self.assertEqual(receipt["session_usage"], self.sessions.session_usage)
+        self.assertEqual(receipt["session_usage_scope"], "session")
+        self.assertTrue(receipt["session_usage_is_provisional"])
+        self.assertTrue(receipt["usage_checked_at"])
+        self.assertIsNone(ledger.next_usage_refresh(utc_now()))
+        self.assertEqual((self.sessions.creates, self.sessions.cancels, self.sessions.deletes), (1, 0, 0))
+
+    def test_missing_or_failed_late_usage_stops_waiting_and_preserves_dossier(self):
+        job = self.completed_job()
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                run_dir = Path(job["run_dir"])
+                server_pilot.update_receipt(run_dir, usage_refresh_attempted_at=None)
+                with patch.object(self.sessions, "retrieve", wraps=self.sessions.retrieve,
+                                  side_effect=ConnectionError("private provider body") if failure else None) as get:
+                    refresh_usage_job(self.cfg, self.controller.ledger, job, client_factory=self.factory)
+                    refresh_usage_job(self.cfg, self.controller.ledger, job, client_factory=self.factory)
+                    self.assertEqual(get.call_count, 1)
+                status = self.controller.status(job["job_id"])
+                self.assertEqual(status["status"], "completed")
+                self.assertEqual(status["receipt"]["usage_status"], "unavailable")
+                self.assertIsNone(status["receipt"]["session_usage"])
+                self.assertNotIn("private provider body", json.dumps(status))
+                self.assertIsNone(self.controller.ledger.next_usage_refresh(utc_now()))
+                self.assertEqual(self.controller.result(job["job_id"])["sha256"], job["dossier_sha256"])
+        self.assertEqual(self.sessions.creates, 1)
+
+    def test_worker_refreshes_due_usage_and_keeps_last_known_counts(self):
+        self.sessions.session_usage = {"input_tokens": 500, "output_tokens": 55}
+        job = self.completed_job()
+        with self.controller.ledger._connect(write=True) as db:
+            db.execute("UPDATE jobs SET updated_at = ? WHERE job_id = ?",
+                       ((datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(), job["job_id"]))
+        self.sessions.session_usage = None
+        with patch("experiments.doknews_research.server_runner.validate_runtime"), \
+                patch.object(server_pilot, "client_for_run", self.factory):
+            self.assertEqual(worker(self.cfg, once=True), 0)
+        receipt = self.controller.status(job["job_id"])["receipt"]
+        self.assertEqual(receipt["usage_status"], "available")
+        self.assertEqual(receipt["session_usage"]["input_tokens"], 500)
+        self.assertTrue(receipt["latest_session_usage_unknown"])
+        self.assertIsNone(self.controller.ledger.next_usage_refresh(utc_now()))
         self.assertEqual(self.sessions.creates, 1)
 
     def test_unknown_create_remains_blocked_and_never_reposts(self):

@@ -15,7 +15,7 @@ from .signal_ledger import Ledger, LedgerBusy, LedgerError
 RECEIPT_FIELDS = (
     "phase", "session_id", "turn_id", "submitted_at", "updated_at", "last_event",
     "result_status", "submission_attempts", "failure_code", "usage", "session_usage",
-    "latest_usage_unknown", "latest_session_usage_unknown", "latest_spend_unknown",
+    "latest_usage_unknown", "latest_session_usage_unknown",
     "usage_scope", "session_usage_scope", "usage_is_provisional", "session_usage_is_provisional",
 )
 PUBLIC_JOB_FIELDS = (
@@ -79,6 +79,12 @@ class Controller:
         result["new_research_submitted"] = bool(state and state.get("submission_attempts", 0) > 0)
         if state is not None:
             result["receipt"] = {key: state[key] for key in RECEIPT_FIELDS if key in state}
+            result["receipt"]["usage_status"] = (
+                "available" if state.get("session_usage") is not None else
+                "unavailable" if state.get("usage_refresh_attempted_at") or
+                job["status"] == "failed" else "pending")
+            result["receipt"]["usage_checked_at"] = (
+                state.get("usage_refresh_attempted_at") or state.get("updated_at"))
         return result
 
     def submit(self, body: dict) -> dict:
