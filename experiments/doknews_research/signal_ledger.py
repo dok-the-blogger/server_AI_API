@@ -449,7 +449,7 @@ class Ledger:
                 raise LedgerError("Only a claimed, unfinished job can be deferred.")
             db.execute("""UPDATE jobs SET status = 'failed', receipt_json = ?,
                 failure_phase = 'capacity_unavailable', failure_message = ?, updated_at = ?
-                WHERE job_id = ?""", (_json(state), "Flex capacity unavailable; retry on a later scheduled run.",
+                WHERE job_id = ?""", (_json(state), FAILURE_MESSAGE,
                                      _now(), job_id))
             # No researched_signals entry: this was not an investigation.
             return self._get(db, job_id)
