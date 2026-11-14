@@ -12,6 +12,12 @@ import pilot
 @unittest.skipUnless(importlib.util.find_spec("openai"), "isolated SDK not installed")
 class InstalledSDKContractTests(unittest.TestCase):
     def test_stream_to_saved_dossier_and_bounded_wire_request(self):
+        self.roundtrip("default")
+
+    def test_flex_stream_to_saved_dossier_through_installed_sdk(self):
+        self.roundtrip("flex")
+
+    def roundtrip(self, service_tier):
         import httpx2
         from openai import OpenAI
 
@@ -56,7 +62,7 @@ class InstalledSDKContractTests(unittest.TestCase):
                 self.assertEqual(request.url.path, "/v1/agents/sessions")
                 sent = json.loads(request.content)
                 self.assertEqual(sent["spend_control"], {"limit": 300})
-                self.assertEqual(sent["agent"]["service_tier"], "default")
+                self.assertEqual(sent["agent"]["service_tier"], service_tier)
                 self.assertEqual(sent["environment"], {"type": "openai_hosted"})
                 self.assertEqual(sent["agent"]["tools"][0]["type"], "web_search")
                 return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=IdleThenOpen())
@@ -78,7 +84,8 @@ class InstalledSDKContractTests(unittest.TestCase):
             snapshot["captured_at"] = datetime.now(timezone.utc).isoformat()
             (folder / "snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
             run_dir = folder / "run"
-            pilot.prepare(folder / "skill", folder / "snapshot.json", run_dir, pilot.DEFAULT_MODEL, False)
+            pilot.prepare(folder / "skill", folder / "snapshot.json", run_dir, pilot.DEFAULT_MODEL, False,
+                          service_tier=service_tier)
             # No real credential and no network-capable transport are present.
             http = httpx2.Client(transport=httpx2.MockTransport(respond), trust_env=False)
             with OpenAI(api_key="offline-contract-only", http_client=http,

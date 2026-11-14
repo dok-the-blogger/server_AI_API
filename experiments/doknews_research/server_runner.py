@@ -153,12 +153,14 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
             cfg.skill_dir, source, run_dir, model=job["model"], include_ai_guide=True,
             no_spend_limit=True, research_mode="new_signals", research_as_of=utc_now(),
             reasoning_effort=cfg.reasoning_effort,
+            service_tier=cfg.service_tier, research_only=True,
         )
         ledger.bind_run(job_id, run_dir, run_id=manifest["run_id"])
         launcher.preflight(run_dir, "run", max_snapshot_hours=cfg.max_snapshot_hours)
         factory = client_factory or pilot.client_for_run
         with factory(run_dir) as client:
-            state = pilot.run(client, run_dir, max_seconds=cfg.max_seconds)
+            state = pilot.run(client, run_dir, max_seconds=(
+                cfg.flex_max_seconds if cfg.service_tier == "flex" else cfg.max_seconds))
         if completed(state):
             return ledger.finish(job_id, state, run_dir / "dossier.md")
         return ledger.fail(job_id, state.get("phase", "unknown"), "No verified result")
@@ -168,6 +170,8 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
             state = pilot.receipt(run_dir)
             if state.get("submission_attempts", 0):
                 phase = state.get("phase", "unknown")
+            if phase == "capacity_unavailable":
+                return ledger.defer_capacity(job_id, state)
         except Exception:
             pass
         ledger.fail(job_id, phase, "Worker stopped; inspect saved receipt")
@@ -187,6 +191,8 @@ def reconcile_job(cfg: ServerConfig, ledger: Ledger, job: dict, *, client_factor
             raise ResearchError("state_integrity", "Saved receipt does not match this job.")
         if completed(state):
             return ledger.finish(job["job_id"], state, run_dir / "dossier.md")
+        if state.get("phase") == "capacity_unavailable":
+            return ledger.defer_capacity(job["job_id"], state)
         if not state.get("session_id") or state.get("session_deleted"):
             return job
         factory = client_factory or pilot.client_for_run
@@ -286,10 +292,11 @@ def worker(cfg: ServerConfig, *, once=False, stop_event=None) -> int:
                 # conversion so shutdown cannot continue with another queued job.
                 if stop_requested.is_set():
                     raise KeyboardInterrupt()
-                heartbeat.update("idle" if result["status"] == "completed" else "recovery_required", job["job_id"])
+                settled = result["status"] == "completed" or result.get("failure_phase") == "capacity_unavailable"
+                heartbeat.update("idle" if settled else "recovery_required", job["job_id"])
                 if once:
-                    heartbeat.update("stopped" if result["status"] == "completed" else "recovery_required", job["job_id"])
-                    return 0 if result["status"] == "completed" else 2
+                    heartbeat.update("stopped" if settled else "recovery_required", job["job_id"])
+                    return 0 if settled else 2
         except KeyboardInterrupt:
             heartbeat.update("stopped")
             return 130

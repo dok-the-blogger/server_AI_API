@@ -87,7 +87,9 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
         expected_agent_keys.add("reasoning")
     if (not isinstance(agent, dict) or set(agent) != expected_agent_keys
             or agent.get("tools") != expected_tools
-            or agent.get("service_tier") != "default"
+            or agent.get("service_tier") not in pilot.SERVICE_TIERS
+            or agent.get("service_tier") != manifest.get("service_tier", "default")
+            or agent.get("service_tier") != state.get("service_tier", "default")
             or request.get("environment") != {"type": "openai_hosted"}
             or agent.get("model") != manifest.get("model")
             or (reasoning_effort is not None and agent.get("reasoning") != {"effort": reasoning_effort})):
