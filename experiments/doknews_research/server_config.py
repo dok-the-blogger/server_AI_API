@@ -37,6 +37,8 @@ class ServerConfig:
     max_seconds: int = 900
     poll_seconds: float = 5.0
     reasoning_effort: str = "medium"
+    service_tier: str = "flex"
+    flex_max_seconds: int = 1800
 
     @property
     def db_path(self) -> Path:
@@ -105,6 +107,8 @@ def load_config(path: Path) -> ServerConfig:
             or type(cfg.max_seconds) is not int or not 30 <= cfg.max_seconds <= 3600
             or not isinstance(cfg.poll_seconds, (int, float)) or isinstance(cfg.poll_seconds, bool)
             or not 1 <= cfg.poll_seconds <= 30 or cfg.reasoning_effort not in ("low", "medium", "high")
+            or cfg.service_tier not in ("default", "flex")
+            or type(cfg.flex_max_seconds) is not int or not 30 <= cfg.flex_max_seconds <= 3600
             or not cfg.consumers or len(cfg.consumers) > 16
             or len(set(cfg.consumers)) != len(cfg.consumers)
             or any(not isinstance(x, str) or not CONSUMER.fullmatch(x) for x in cfg.consumers)):

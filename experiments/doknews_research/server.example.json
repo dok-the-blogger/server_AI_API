@@ -10,5 +10,7 @@
   "max_snapshot_hours": 1.0,
   "max_seconds": 900,
   "poll_seconds": 5.0,
-  "reasoning_effort": "medium"
+  "reasoning_effort": "medium",
+  "service_tier": "flex",
+  "flex_max_seconds": 1800
 }

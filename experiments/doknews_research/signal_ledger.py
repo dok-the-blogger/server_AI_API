@@ -19,6 +19,7 @@ import uuid
 
 
 UNRESOLVED = ("queued", "running", "unknown", "failed")
+BLOCKING_SQL = "(status IN ('queued','running','unknown') OR (status = 'failed' AND COALESCE(failure_phase, '') != 'capacity_unavailable'))"
 FINISHABLE = ("running", "unknown", "failed", "completed")
 MAX_DOSSIER_BYTES = 2_000_000
 # Deliberately exclude fetch/read timestamps, retrieval, review state, and
@@ -160,7 +161,7 @@ class Ledger:
             raise LedgerError("Cannot create or protect the research ledger.") from exc
         with self._connect(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise LedgerError("Unsupported research ledger schema.")
             db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                 job_id TEXT PRIMARY KEY, consumer TEXT NOT NULL,
@@ -172,8 +173,10 @@ class Ledger:
                 run_dir TEXT, run_id TEXT, receipt_json TEXT, dossier_sha256 TEXT,
                 failure_phase TEXT, failure_message TEXT,
                 UNIQUE(consumer, request_id))""")
-            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_consumer
-                ON jobs(consumer) WHERE status IN ('queued','running','unknown','failed')""")
+            if version < 2:
+                db.execute("DROP INDEX IF EXISTS one_unresolved_consumer")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_consumer "
+                       "ON jobs(consumer) WHERE " + BLOCKING_SQL)
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 consumer TEXT NOT NULL, request_id TEXT NOT NULL, payload_sha256 TEXT NOT NULL,
                 job_id TEXT REFERENCES jobs(job_id), response_json TEXT,
@@ -183,7 +186,7 @@ class Ledger:
                 fingerprint TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id),
                 researched_at TEXT NOT NULL,
                 PRIMARY KEY(consumer, signal_id, version, fingerprint))""")
-            db.execute("PRAGMA user_version = 1")
+            db.execute("PRAGMA user_version = 2")
 
     @contextmanager
     def _connect(self, write=False):
@@ -249,8 +252,8 @@ class Ledger:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise LedgerError("Unresolved job list limit must be an integer from 1 to 1000.")
         with self._connect() as db:
-            rows = db.execute("""SELECT * FROM jobs WHERE status IN ('running','unknown','failed')
-                ORDER BY created_at, job_id LIMIT ?""", (limit,)).fetchall()
+            rows = db.execute("SELECT * FROM jobs WHERE status != 'queued' AND " + BLOCKING_SQL +
+                " ORDER BY created_at, job_id LIMIT ?", (limit,)).fetchall()
             return [self._job(row) for row in rows]
 
     def next_usage_refresh(self, before: str) -> dict | None:
@@ -287,8 +290,8 @@ class Ledger:
             frozen["coverage"]["missing"].append(
                 "Research ledger selected a bounded batch; omitted signals are not included in this request.")
         counts.update(coverage=frozen["coverage"], input_coverage=snapshot["coverage"])
-        blocked = db.execute("""SELECT job_id FROM jobs WHERE consumer = ?
-            AND status IN ('queued','running','unknown','failed')""", (consumer,)).fetchone()
+        blocked = db.execute("SELECT job_id FROM jobs WHERE consumer = ? AND " + BLOCKING_SQL,
+                             (consumer,)).fetchone()
         return {"consumer": consumer, **counts, "selected_signals": selected,
                 "selected_identities": selected_ids, "snapshot": frozen,
                 "blocked_job_id": blocked["job_id"] if blocked else None}
@@ -427,6 +430,30 @@ class Ledger:
                 (saved_receipt, actual, finished, job_id))
             return self._get(db, job_id)
 
+    def defer_capacity(self, job_id: str, state: dict) -> dict:
+        """Release only a positively rejected Flex create; preserve its replay/history."""
+        error = state.get("observer_error", {})
+        if (state.get("phase") != "capacity_unavailable" or state.get("service_tier") != "flex"
+                or state.get("create_accepted") is not False or state.get("session_id") or state.get("turn_id")
+                or state.get("api_stage") != "create_request" or state.get("submission_attempts") != 1
+                or error.get("http_status") != 429
+                or error.get("error", {}).get("code") != "resource_unavailable"):
+            raise LedgerError("Capacity deferral requires a confirmed rejected Flex creation.")
+        with self._connect(write=True) as db:
+            job = self._get(db, job_id)
+            if not job.get("run_id") or state.get("run_id") != job["run_id"]:
+                raise LedgerError("Capacity receipt does not match its job.")
+            if job["status"] == "failed" and job.get("failure_phase") == "capacity_unavailable":
+                return job
+            if job["status"] not in ("running", "unknown", "failed"):
+                raise LedgerError("Only a claimed, unfinished job can be deferred.")
+            db.execute("""UPDATE jobs SET status = 'failed', receipt_json = ?,
+                failure_phase = 'capacity_unavailable', failure_message = ?, updated_at = ?
+                WHERE job_id = ?""", (_json(state), "Flex capacity unavailable; retry on a later scheduled run.",
+                                     _now(), job_id))
+            # No researched_signals entry: this was not an investigation.
+            return self._get(db, job_id)
+
     def fail(self, job_id: str, phase: str, message: str) -> dict:
         """Keep the consumer blocked. Arbitrary exception text is never persisted.
 
@@ -436,6 +463,8 @@ class Ledger:
         """
         if not isinstance(phase, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", phase):
             raise LedgerError("Invalid research failure phase.")
+        if phase == "capacity_unavailable":
+            raise LedgerError("Use checked capacity deferral, not an unverified failure label.")
         status = "unknown" if phase in ("unknown", "creation_unknown", "submitting", "submission_unknown") else "failed"
         with self._connect(write=True) as db:
             job = self._get(db, job_id)

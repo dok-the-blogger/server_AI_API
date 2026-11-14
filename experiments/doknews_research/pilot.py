@@ -39,6 +39,8 @@ POLICY_FILES = (
     "references/DOKNEWS_EDITORIAL_MEMORY.md",
 )
 AI_GUIDE = "references/DOKNEWS_AI_EDITORIAL_GUIDE.md"
+RESEARCH_POLICY_FILES = POLICY_FILES[1:3]
+SERVICE_TIERS = {"default", "flex"}
 SECRET_PATTERN = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{24,}")
 PROJECT_ID_PATTERN = re.compile(r"proj_[A-Za-z0-9_-]{1,100}")
 
@@ -175,7 +177,10 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
             include_ai_guide: bool = False, spend_limit_cents: int | None = DEFAULT_SPEND_LIMIT_CENTS,
             project_id: str | None = None, no_spend_limit: bool = False, *,
             research_mode: str = "general", research_as_of: str | None = None,
-            reasoning_effort: str | None = None):
+            reasoning_effort: str | None = None, service_tier: str = "default",
+            research_only: bool = False):
+    if service_tier not in SERVICE_TIERS or type(research_only) is not bool:
+        raise PilotError("Unsupported research profile or service tier.")
     if reasoning_effort is not None and (type(reasoning_effort) is not str or reasoning_effort not in REASONING_EFFORTS):
         raise PilotError("Unsupported explicit reasoning effort.")
     if type(no_spend_limit) is not bool:
@@ -196,9 +201,10 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
                           "monthly_limit_cents": spend_limit_cents}
     snapshot = read_json(snapshot_path)
     validate_snapshot(snapshot)
-    contract = read_text(BASE / "dossier_contract.md")
+    contract = read_text(BASE / ("research_scope.md" if research_only else "dossier_contract.md"))
     bundle = []
-    files = [*POLICY_FILES, *([AI_GUIDE] if include_ai_guide else [])]
+    files = [*(RESEARCH_POLICY_FILES if research_only else POLICY_FILES),
+             *([AI_GUIDE] if include_ai_guide else [])]
     for relative in files:
         text = read_text(skill_dir / relative)
         bundle.append({"path": relative, "sha256": digest(text.encode()), "text": text})
@@ -206,6 +212,9 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
     instructions = contract + "\n\n# Действующие инструкции исследовательского этапа\n"
     for source in bundle:
         instructions += f"\n## Файл: {source['path']}\n{source['text']}\n"
+    if research_only:
+        instructions += ("\n\nВыполни только исследовательский контракт в начале пакета. "
+            "Операционные поручения редактору внутри справочных правил здесь не выполняются.\n")
     try:
         built_context = research_context.build_context(
             snapshot, run_id, research_mode=research_mode,
@@ -215,7 +224,7 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
     request = {
         "agent": {
             "model": model,
-            "service_tier": "default",
+            "service_tier": service_tier,
             "instructions": instructions,
             "tools": [{"type": "web_search", "mode": "live", "context_size": "medium"}],
         },
@@ -249,6 +258,8 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
         "ai_guide_included": include_ai_guide,
         "spend_limit_cents": spend_limit_cents,
         "reasoning_effort": reasoning_effort,
+        "service_tier": service_tier,
+        "instruction_profile": "research_v1" if research_only else "legacy_full",
         "instructions_sha256": digest(instructions.encode("utf-8")),
         "context_prefix_sha256": digest((instructions + "\n\n" + built_context.stable_prefix).encode("utf-8")),
         **built_context.metadata,
@@ -262,6 +273,7 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
         "session_id": None, "turn_id": None, "created_at": now(),
         "request_sha256": manifest["request_sha256"], "usage": None,
         "submission_attempts": 0,
+        "service_tier": service_tier,
         "spend_limit_cents": spend_limit_cents,
         "research_mode": built_context.metadata["research_mode"],
         "research_as_of": built_context.metadata["research_as_of"],
@@ -432,10 +444,14 @@ def safe_error(exc: Exception) -> dict:
 
 
 def is_http_400(exc: Exception) -> bool:
+    return is_http_status(exc, 400)
+
+
+def is_http_status(exc: Exception, status: int) -> bool:
     try:
         from openai import APIStatusError
-        return (isinstance(exc, APIStatusError) and exc.status_code == 400
-                and exc.response.status_code == 400)
+        return (isinstance(exc, APIStatusError) and exc.status_code == status
+                and exc.response.status_code == status)
     except Exception:
         return False
 
@@ -445,7 +461,7 @@ def failure_code(value):
     return code if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else None
 
 
-def make_client(project_id: str | None = None):
+def make_client(project_id: str | None = None, *, timeout: float = 60):
     if project_id is not None and (type(project_id) is not str or not PROJECT_ID_PATTERN.fullmatch(project_id)):
         raise PilotError("Invalid project ID for the API client.")
     key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -460,7 +476,7 @@ def make_client(project_id: str | None = None):
     except importlib.metadata.PackageNotFoundError as exc:
         raise PilotError("Install requirements-pilot.txt in the isolated pilot environment.") from exc
     # Never inherit a different provider's OPENAI_BASE_URL. Disable SDK POST retries.
-    return OpenAI(api_key=key, base_url="https://api.openai.com/v1", max_retries=0, timeout=60,
+    return OpenAI(api_key=key, base_url="https://api.openai.com/v1", max_retries=0, timeout=timeout,
                   **({"project": project_id} if project_id is not None else {}))
 
 
@@ -471,14 +487,15 @@ def client_for_run(run_dir: Path):
     entire immutable packet before any new submission.
     """
     state = receipt(run_dir)
+    client_options = {"timeout": 600} if state.get("service_tier") == "flex" else {}
     if "budget_control" in state:
         policy = state["budget_control"]
         if type(policy) is dict and policy.get("kind") == "unlimited":
             _checked_unlimited_budget(state)
-            return make_client()
+            return make_client(**client_options)
         policy = _checked_project_budget(policy, state.get("spend_limit_cents"))
-        return make_client(project_id=policy["project_id"])
-    return make_client()
+        return make_client(project_id=policy["project_id"], **client_options)
+    return make_client(**client_options)
 
 
 def record_event(run_dir: Path, event):
@@ -714,9 +731,17 @@ def run(client, run_dir: Path, max_seconds: int = 900, project_limit_confirmed: 
         except Exception:
             pass
         rejected = api_stage == "create_request" and not create_accepted and is_http_400(exc)
-        changes = {"observer_error": safe_error(exc), "api_stage": api_stage,
+        diagnostic = safe_error(exc)
+        capacity_rejected = (api_stage == "create_request" and not create_accepted
+            and not current.get("session_id") and request["agent"].get("service_tier") == "flex"
+            and is_http_status(exc, 429)
+            and diagnostic.get("http_status") == 429
+            and diagnostic.get("error", {}).get("code") == "resource_unavailable")
+        changes = {"observer_error": diagnostic, "api_stage": api_stage,
                    "create_accepted": create_accepted}
-        if rejected:
+        if capacity_rejected:
+            changes.update(phase="capacity_unavailable", failure_code="resource_unavailable")
+        elif rejected:
             changes["phase"] = "creation_rejected"
         elif not current.get("session_id"):
             changes["phase"] = "creation_unknown"
@@ -739,7 +764,9 @@ def run(client, run_dir: Path, max_seconds: int = 900, project_limit_confirmed: 
             raise
         diagnostic = ("See receipt.json observer_error." if diagnostic_saved
                       else "The receipt diagnostic could not be saved.")
-        if rejected:
+        if capacity_rejected:
+            message = "Flex capacity is unavailable; this session creation was rejected."
+        elif rejected:
             message = "The API rejected session creation (HTTP 400)."
         elif api_stage == "create_request":
             message = "Session creation could not be confirmed. Inspect Platform sessions."
