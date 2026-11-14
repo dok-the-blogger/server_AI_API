@@ -48,6 +48,13 @@ class FlexFlowTests(unittest.TestCase):
         create.assert_called_once()
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failure_phase"], "capacity_unavailable")
+        # DOK Agents keeps a strict fixed-message contract; detail lives in codes.
+        public = self.http.get(f"/research/jobs/{job['job_id']}", headers=self.headers).json()
+        self.assertEqual(public["failure_message"],
+            "Research did not produce a verified result; inspect the saved run receipt.")
+        self.assertEqual(public["receipt"]["phase"], "capacity_unavailable")
+        self.assertEqual(public["receipt"]["failure_code"], "resource_unavailable")
+        self.assertIsNone(public["receipt"]["session_id"])
         self.assertEqual(self.controller.ledger.list_unresolved(), [])
         self.assertEqual(self.submit().json()["job_id"], job["job_id"])
         self.assertEqual(self.http.get(f"/research/jobs/{job['job_id']}/result", headers=self.headers).status_code, 409)
