@@ -89,6 +89,46 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "different payload"):
             self.enqueue(limit=2)
 
+    def test_version_two_unsubmitted_preflight_migrates_without_erasing_history(self):
+        job = self.enqueue()
+        self.ledger.claim(job["job_id"])
+        self.ledger.bind_run(job["job_id"], self.root / "unprepared")
+        failed = self.ledger.fail(job["job_id"], "preflight_failed", "not submitted")
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("DROP INDEX one_unresolved_consumer")
+            db.execute("CREATE UNIQUE INDEX one_unresolved_consumer ON jobs(consumer) WHERE "
+                       "(status IN ('queued','running','unknown') OR "
+                       "(status='failed' AND COALESCE(failure_phase,'')!='capacity_unavailable'))")
+            db.execute("PRAGMA user_version=2")
+        self.ledger = Ledger(self.db_path)
+        self.assertEqual(self.ledger.get_job(job["job_id"]), failed)
+        self.assertEqual(self.enqueue()["job_id"], job["job_id"])
+        self.assertEqual(self.ledger.list_unresolved(), [])
+        fresh = self.enqueue(request_id="new-request")
+        self.assertEqual(fresh["status"], "queued")
+        self.assertEqual(len(fresh["selected_signals"]), 1)
+        with sqlite3.connect(self.db_path) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("SELECT count(*) FROM researched_signals").fetchone()[0], 0)
+
+    def test_uncertain_failures_and_preflight_with_any_session_evidence_remain_blocking(self):
+        cases = [("unknown", None, None), ("failed", None, None),
+                 ("preflight_failed", "bound-run", None), ("preflight_failed", None, "{}")]
+        for number, (phase, run_id, receipt) in enumerate(cases):
+            with self.subTest(phase=phase, run_id=run_id, receipt=receipt):
+                ledger = Ledger(self.root / f"case-{number}.sqlite3")
+                job = ledger.enqueue(self.consumer, "old", snapshot(), "gpt-6.1-sol")
+                ledger.claim(job["job_id"])
+                if run_id:
+                    ledger.bind_run(job["job_id"], self.root / run_id, run_id=run_id)
+                if receipt is not None:
+                    with sqlite3.connect(ledger.db_path) as db:
+                        db.execute("UPDATE jobs SET receipt_json=? WHERE job_id=?", (receipt, job["job_id"]))
+                ledger.fail(job["job_id"], phase, "uncertain")
+                self.assertEqual(len(ledger.list_unresolved()), 1)
+                with self.assertRaises(LedgerBusy):
+                    ledger.enqueue(self.consumer, "new", snapshot(), "gpt-6.1-sol")
+
     def test_read_only_replay_returns_old_snapshot_job_without_reserving(self):
         value = snapshot()
         value["captured_at"] = "2020-01-01T00:00:00Z"

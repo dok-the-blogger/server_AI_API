@@ -149,7 +149,9 @@ def validate_snapshot(snapshot: dict, cfg: ServerConfig, *, check_freshness=True
     captured = timestamp(snapshot.get("captured_at"))
     if check_freshness:
         age = (datetime.now(timezone.utc) - captured).total_seconds()
-        if age < -300 or age > cfg.max_snapshot_hours * 3600:
+        if age < 0:
+            raise ResearchError("stale_snapshot", "Snapshot captured_at is in the future; use the current UTC clock.", 422)
+        if age > cfg.max_snapshot_hours * 3600:
             raise ResearchError("stale_snapshot", "Prepare current source data before new research.", 422)
 
 
