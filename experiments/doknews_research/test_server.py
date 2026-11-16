@@ -322,6 +322,34 @@ class ServerFlowTests(unittest.TestCase):
         self.assertEqual(stopped["failure_phase"], "preflight_failed")
         self.assertEqual(self.factory_calls, 0)
 
+    def test_future_snapshot_rejected_without_reservation_then_current_job_finishes(self):
+        future = {**self.snapshot, "captured_at": (datetime.now(timezone.utc) + timedelta(seconds=140)).isoformat()}
+        rejected = self.submit({**self.body, "snapshot": future})
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(rejected.json()["detail"]["code"], "stale_snapshot")
+        self.assertIsNone(self.controller.ledger.next_queued())
+        self.assertEqual(self.factory_calls, 0)
+        accepted = self.submit().json()
+        final = execute_job(self.cfg, self.controller.ledger, accepted["job_id"], client_factory=self.factory)
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(self.sessions.creates, 1)
+
+    def test_prepare_failure_releases_slot_preserves_replay_and_allows_next_research(self):
+        accepted = self.submit().json()
+        with patch.object(server_pilot, "prepare", side_effect=ValueError("preparation failed")):
+            failed = execute_job(self.cfg, self.controller.ledger, accepted["job_id"], client_factory=self.factory)
+        self.assertEqual(failed["failure_phase"], "preflight_failed")
+        self.assertIsNone(failed["run_id"])
+        self.assertIsNone(failed["receipt"])
+        self.assertEqual(self.controller.ledger.list_unresolved(), [])
+        self.assertEqual(self.factory_calls, 0)
+        self.assertEqual(self.submit().json()["job_id"], accepted["job_id"])
+        fresh = self.submit({**self.body, "request_id": str(uuid.uuid4())})
+        self.assertEqual(fresh.status_code, 202, fresh.text)
+        final = execute_job(self.cfg, self.controller.ledger, fresh.json()["job_id"], client_factory=self.factory)
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(self.sessions.creates, 1)
+
     def test_private_result_tampering_is_detected(self):
         job = self.submit().json()
         final = execute_job(self.cfg, self.controller.ledger, job["job_id"], client_factory=self.factory)

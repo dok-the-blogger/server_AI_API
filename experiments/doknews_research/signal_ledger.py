@@ -19,7 +19,13 @@ import uuid
 
 
 UNRESOLVED = ("queued", "running", "unknown", "failed")
-BLOCKING_SQL = "(status IN ('queued','running','unknown') OR (status = 'failed' AND COALESCE(failure_phase, '') != 'capacity_unavailable'))"
+# execute_job binds run_id before entering any API client. A preparation failure
+# without that binding or a saved receipt cannot have submitted paid research.
+# Keep the failed row and exact-request replay, but do not strand the consumer.
+BLOCKING_SQL = """(status IN ('queued','running','unknown') OR
+    (status = 'failed' AND COALESCE(failure_phase, '') != 'capacity_unavailable'
+     AND NOT (COALESCE(failure_phase, '') = 'preflight_failed'
+              AND run_id IS NULL AND receipt_json IS NULL)))"""
 FINISHABLE = ("running", "unknown", "failed", "completed")
 MAX_DOSSIER_BYTES = 2_000_000
 # Deliberately exclude fetch/read timestamps, retrieval, review state, and
@@ -161,7 +167,7 @@ class Ledger:
             raise LedgerError("Cannot create or protect the research ledger.") from exc
         with self._connect(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise LedgerError("Unsupported research ledger schema.")
             db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                 job_id TEXT PRIMARY KEY, consumer TEXT NOT NULL,
@@ -173,7 +179,7 @@ class Ledger:
                 run_dir TEXT, run_id TEXT, receipt_json TEXT, dossier_sha256 TEXT,
                 failure_phase TEXT, failure_message TEXT,
                 UNIQUE(consumer, request_id))""")
-            if version < 2:
+            if version < 3:
                 db.execute("DROP INDEX IF EXISTS one_unresolved_consumer")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_consumer "
                        "ON jobs(consumer) WHERE " + BLOCKING_SQL)
@@ -186,7 +192,7 @@ class Ledger:
                 fingerprint TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id),
                 researched_at TEXT NOT NULL,
                 PRIMARY KEY(consumer, signal_id, version, fingerprint))""")
-            db.execute("PRAGMA user_version = 2")
+            db.execute("PRAGMA user_version = 3")
 
     @contextmanager
     def _connect(self, write=False):
@@ -455,7 +461,7 @@ class Ledger:
             return self._get(db, job_id)
 
     def fail(self, job_id: str, phase: str, message: str) -> dict:
-        """Keep the consumer blocked. Arbitrary exception text is never persisted.
+        """Keep uncertain failures blocked; release only unbound preflight failures.
 
         ``message`` is intentionally not echoed: a worker may accidentally pass
         an SDK exception containing request data, credentials or local paths.

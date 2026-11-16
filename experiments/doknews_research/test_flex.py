@@ -110,7 +110,7 @@ class FlexFlowTests(unittest.TestCase):
         self.assertEqual(reopened.get_job(job["job_id"])["status"], "queued")
         self.assertEqual(reopened.plan("doknews-api-hourly", self.snapshot)["blocked_job_id"], job["job_id"])
         with sqlite3.connect(self.cfg.db_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_unrecognized_or_mismatched_tier_fails_before_submission(self):
         source = self.root / "snapshot.json"
