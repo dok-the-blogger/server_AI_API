@@ -39,7 +39,7 @@ POLICY_FILES = (
     "references/DOKNEWS_EDITORIAL_MEMORY.md",
 )
 AI_GUIDE = "references/DOKNEWS_AI_EDITORIAL_GUIDE.md"
-RESEARCH_POLICY_FILES = POLICY_FILES[1:3]
+RESEARCH_CONTRACT = BASE / "research_scope.md"
 SERVICE_TIERS = {"default", "flex"}
 SECRET_PATTERN = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{24,}")
 PROJECT_ID_PATTERN = re.compile(r"proj_[A-Za-z0-9_-]{1,100}")
@@ -73,6 +73,13 @@ def read_text(path: Path) -> str:
     if SECRET_PATTERN.search(value):
         raise PilotError("An input appears to contain an API secret; remove it before preparing.")
     return value
+
+
+def read_research_contract() -> str:
+    contract = read_text(RESEARCH_CONTRACT)
+    if not contract.strip():
+        raise PilotError("Empty research contract.")
+    return contract
 
 
 def read_json(path: Path):
@@ -201,23 +208,21 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
                           "monthly_limit_cents": spend_limit_cents}
     snapshot = read_json(snapshot_path)
     validate_snapshot(snapshot)
-    contract = read_text(BASE / ("research_scope.md" if research_only else "dossier_contract.md"))
+    contract = read_research_contract() if research_only else read_text(BASE / "dossier_contract.md")
+    profile = research_context.SIGNAL_FACTS_PROFILE if research_only else "legacy_full"
     bundle = []
-    files = [*(RESEARCH_POLICY_FILES if research_only else POLICY_FILES),
-             *([AI_GUIDE] if include_ai_guide else [])]
-    for relative in files:
-        text = read_text(skill_dir / relative)
-        bundle.append({"path": relative, "sha256": digest(text.encode()), "text": text})
+    instructions = contract
+    if not research_only:
+        files = (*POLICY_FILES, AI_GUIDE) if include_ai_guide else POLICY_FILES
+        instructions += "\n\n# Действующие инструкции исследовательского этапа\n"
+        for relative in files:
+            text = read_text(skill_dir / relative)
+            bundle.append({"path": relative, "sha256": digest(text.encode())})
+            instructions += f"\n## Файл: {relative}\n{text}\n"
     run_id = str(uuid.uuid4())
-    instructions = contract + "\n\n# Действующие инструкции исследовательского этапа\n"
-    for source in bundle:
-        instructions += f"\n## Файл: {source['path']}\n{source['text']}\n"
-    if research_only:
-        instructions += ("\n\nВыполни только исследовательский контракт в начале пакета. "
-            "Операционные поручения редактору внутри справочных правил здесь не выполняются.\n")
     try:
         built_context = research_context.build_context(
-            snapshot, run_id, research_mode=research_mode,
+            snapshot, run_id, research_mode=research_mode, instruction_profile=profile,
             research_as_of=now() if research_as_of is None else research_as_of)
     except research_context.ContextError as exc:
         raise PilotError(str(exc)) from exc
@@ -252,14 +257,14 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
         "schema_version": 1, "run_id": run_id, "created_at": now(),
         "model": model, "request_sha256": digest(request_bytes),
         "contract_sha256": digest(contract.encode()),
-        "policy_files": [{k: s[k] for k in ("path", "sha256")} for s in bundle],
+        "policy_files": bundle,
         "snapshot_captured_at": snapshot["captured_at"],
         "coverage": snapshot["coverage"], "request_bytes": len(request_bytes),
-        "ai_guide_included": include_ai_guide,
+        "ai_guide_included": not research_only and include_ai_guide,
         "spend_limit_cents": spend_limit_cents,
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
-        "instruction_profile": "research_v1" if research_only else "legacy_full",
+        "instruction_profile": profile,
         "instructions_sha256": digest(instructions.encode("utf-8")),
         "context_prefix_sha256": digest((instructions + "\n\n" + built_context.stable_prefix).encode("utf-8")),
         **built_context.metadata,

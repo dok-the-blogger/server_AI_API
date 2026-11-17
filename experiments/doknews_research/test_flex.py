@@ -21,20 +21,24 @@ class FlexFlowTests(unittest.TestCase):
     factory = fixtures.ServerFlowTests.factory
 
     def test_flex_profile_passes_real_preflight_and_produces_dossier(self):
-        for name in pilot.POLICY_FILES:
-            (self.skill / name).write_text("Unique policy " + name)
+        for name in (*pilot.POLICY_FILES, pilot.AI_GUIDE):
+            (self.skill / name).unlink()
         job = self.submit().json()
         result = execute_job(self.cfg, self.controller.ledger, job["job_id"], client_factory=self.factory)
         self.assertEqual(result["status"], "completed")
         request = self.sessions.request
         self.assertEqual(request["agent"]["service_tier"], "flex")
         text = request["agent"]["instructions"]
-        for name in pilot.RESEARCH_POLICY_FILES:
-            self.assertIn("Unique policy " + name, text)
-        self.assertNotIn("Unique policy SKILL.md", text)
-        self.assertNotIn("Unique policy references/DOKNEWS_EDITORIAL_MEMORY.md", text)
+        self.assertEqual(text, pilot.read_text(pilot.RESEARCH_CONTRACT))
+        self.assertNotIn("dossier_contract", request["input"])
+        self.assertNotIn('"task_instructions":', request["input"])
         self.assertIn("ai_inference_ceiling", text)
-        state = pilot.receipt(self.cfg.state_dir / "runs" / job["job_id"] / "pilot")
+        run_dir = self.cfg.state_dir / "runs" / job["job_id"] / "pilot"
+        manifest = pilot.read_json(run_dir / "manifest.json")
+        self.assertEqual(manifest["instruction_profile"], "signal_facts_v2")
+        self.assertEqual(manifest["policy_files"], [])
+        self.assertFalse(manifest["ai_guide_included"])
+        state = pilot.receipt(run_dir)
         self.assertEqual(state["service_tier"], "flex")
         self.assertEqual(self.sessions.creates, 1)
 

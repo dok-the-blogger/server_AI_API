@@ -98,12 +98,12 @@ Standard. В Flex клиент ждёт отдельный HTTP-ответ до 
 по-прежнему отключены; дорогого автоматического fallback нет. Старые run
 receipts без tier продолжаются с прежним профилем, новые POST не создаются.
 
-Профиль `research_v1` передаёт канонические политику, калибровку и ИИ-приложение
-без пересказа. SKILL.md и операционная инструкция редакционной памяти больше
-не входят в серверный prompt; правила применения фактов памяти и её пределов
-сохранены в `research_scope.md`. Короткий контракт требует ответ непосредственно
-в досье, раннюю проверку свежести, адресные первоисточники и прекращение
-бесплодного повторного поиска. Полная редактура/публикация остаются в ChatGPT.
+Профиль `signal_facts_v2` использует одно постоянное поручение из
+`research_scope.md` для всех тематик. Sol устанавливает изменение, дату,
+доказательства и их пределы по каждому переданному сигналу. Доказанный повтор
+или старый повод закрывается одной строкой; недоступный оригинал остаётся
+открытым вопросом. Редактор Work применяет политику и калибровку, выбирает
+финалиста и отвечает за публикацию. Сохранённые пакеты читаются по исходному профилю.
 
 Только подтверждённый HTTP 429 `resource_unavailable` **до принятия create**,
 без session/turn ID и при запрошенном Flex, закрывается как
@@ -155,31 +155,17 @@ sudo /usr/bin/python3.12 -m venv /opt/doknews-research/venv
 sudo /opt/doknews-research/venv/bin/python -I -m pip install --only-binary=:all: -r /opt/ai-service/experiments/doknews_research/requirements-pilot.txt
 sudo install -d -o ai-service -g ai-service -m 0700 /var/lib/doknews-research
 sudo install -d -o root -g ai-service -m 0750 /etc/doknews-research
-sudo install -d -o root -g ai-service -m 0750 /etc/doknews-research/policy
-sudo install -d -o root -g ai-service -m 0750 /etc/doknews-research/policy/references
 sudo install -o root -g ai-service -m 0640 /opt/ai-service/experiments/doknews_research/server.example.json /etc/doknews-research/config.json
 ```
 
 Последняя команда предназначена для первой установки. При обновлениях не
 перезаписывать существующий config: сохранить его выбранные параметры.
 
-### Политика
+### Исследовательское поручение
 
-В `/etc/doknews-research/policy` устанавливается актуальный приватный пакет
-навыка, без редакционного сокращения:
-
-```text
-SKILL.md
-references/DOKNEWS_EDITORIAL_POLICY.md
-references/DOKNEWS_EDITORIAL_CALIBRATION.md
-references/DOKNEWS_EDITORIAL_MEMORY.md
-references/DOKNEWS_AI_EDITORIAL_GUIDE.md
-```
-
-Файлы — UTF-8, обычные файлы без symlink, `root:ai-service`, права `0640`.
-Полный пакет не коммитится в этот репозиторий. Manifest каждого исследования
-сохраняет хеши фактически использованных инструкций. Изменение политики требует
-установки обновлённого пакета до нового исследования.
+Контракт `research_scope.md` поставляется с серверным кодом. Manifest сохраняет
+версию профиля и SHA-256 инструкций. Для отдельного ручного пилота с полными
+редакционными приложениями действует порядок из README.
 
 ### Ключ и конфигурация
 
@@ -220,8 +206,8 @@ Git, snapshot, конфигурационный JSON или журналы.
 sudo -u ai-service /opt/doknews-research/venv/bin/python -I -X utf8 /opt/ai-service/experiments/doknews_research/server_runner.py check --config /etc/doknews-research/config.json
 ```
 
-Он проверяет конфигурацию, доступность приватных файлов, версию SDK и комплект
-политики, не создавая API-сессию и не исполняя очередь. Успех не доказывает
+Он проверяет конфигурацию, доступность ключа, версию SDK и исследовательский
+контракт, не создавая API-сессию и не исполняя очередь. Успех не доказывает
 доступность модели, действительность ключа на стороне OpenAI или наличие кредитов.
 `worker --once` для такой проверки не подходит: он может исполнить queued job.
 
@@ -243,7 +229,7 @@ AI_API_RESEARCH_CONFIG_PATH=/etc/doknews-research/config.json
 и штатно перезапустить ai-service. Родитель запускает ровно один отдельный worker;
 дополнительный cron или второй unit для того же state_dir не создаётся.
 Приватный `worker-status.json` сообщает phase и observed_at. Новый start принимается
-только при свежем heartbeat `idle`/`running` после проверки SDK, ключа и политики.
+только при свежем heartbeat `idle`/`running` после проверки SDK, ключа и контракта.
 `/readyz.ai_research` у DOK Agents подтверждает только готовность локального
 HTTP-клиента, не состояние worker или OpenAI.
 Если дочерний процесс завершится, общий `/health` ai-service может оставаться
