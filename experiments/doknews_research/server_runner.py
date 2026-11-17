@@ -58,14 +58,12 @@ def load_credential(cfg: ServerConfig):
 def validate_runtime(cfg: ServerConfig) -> dict:
     """Check local prerequisites without opening the queue or calling OpenAI."""
     load_credential(cfg)
-    files = (*pilot.POLICY_FILES, pilot.AI_GUIDE)
     try:
-        for relative in files:
-            pilot.read_text(cfg.skill_dir / relative)
+        pilot.read_research_contract()
     except (pilot.PilotError, OSError) as exc:
-        raise ResearchError("policy_unavailable", "The complete local research policy bundle is unavailable or invalid.") from exc
+        raise ResearchError("policy_unavailable", "The research contract is unavailable or invalid.") from exc
     return {"status": "ready", "api_enabled": cfg.api_enabled, "model": cfg.model,
-            "sdk_version": "3.49.0", "policy_files_count": len(files), "api_request_made": False}
+            "sdk_version": "3.49.0", "policy_files_count": 1, "api_request_made": False}
 
 
 @contextmanager
@@ -150,7 +148,7 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
         source = cfg.state_dir / "inputs" / (job_id + ".json")
         pilot.atomic_bytes(source, json_bytes(job["snapshot"]))
         manifest = pilot.prepare(
-            cfg.skill_dir, source, run_dir, model=job["model"], include_ai_guide=True,
+            cfg.skill_dir, source, run_dir, model=job["model"],
             no_spend_limit=True, research_mode="new_signals", research_as_of=utc_now(),
             reasoning_effort=cfg.reasoning_effort,
             service_tier=cfg.service_tier, research_only=True,

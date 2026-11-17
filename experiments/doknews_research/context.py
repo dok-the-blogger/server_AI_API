@@ -9,6 +9,7 @@ import re
 
 
 LAYOUT_VERSION = 2
+SIGNAL_FACTS_PROFILE = "signal_facts_v2"
 SNAPSHOT_HASH_FORMAT = "canonical_json_v1"
 COLLECTIONS = ("archive_articles", "memory_records")
 READ_FIELDS = frozenset({"read_at", "fetched_at", "retrieved_at", "read_interval"})
@@ -97,8 +98,13 @@ def _collection(records: list, name: str):
     return ([row[2] for row in rows], [row[1] for row in rows], [row[3] for row in rows])
 
 
+def _header(instruction_profile):
+    # Older packets must reconstruct byte for byte during resume and inspection.
+    return "" if instruction_profile == SIGNAL_FACTS_PROFILE else HEADER
+
+
 def build_context(snapshot: dict, run_id: str, *, research_mode: str = "general",
-                  research_as_of: str) -> BuiltContext:
+                  research_as_of: str, instruction_profile: str | None = None) -> BuiltContext:
     if type(snapshot) is not dict or snapshot.get("schema_version") != 1:
         raise ContextError("Unsupported snapshot schema.")
     if type(run_id) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
@@ -124,13 +130,14 @@ def build_context(snapshot: dict, run_id: str, *, research_mode: str = "general"
     dynamic = {
         "run_id": run_id, "research_mode": research_mode, "research_as_of": as_of.isoformat(),
         "research_window": window,
-        "task_instructions": MODE_INSTRUCTIONS[research_mode] + WINDOW_INSTRUCTIONS,
         "snapshot": {key: value for key, value in snapshot.items() if key not in COLLECTIONS},
         "source_record_order": order, "read_observations": observations,
     }
+    if instruction_profile != SIGNAL_FACTS_PROFILE or research_mode != "new_signals":
+        dynamic["task_instructions"] = MODE_INSTRUCTIONS[research_mode] + WINDOW_INSTRUCTIONS
     # Ensure unknown snapshot fields are retained and all values are valid JSON.
     snapshot_hash = _sha(snapshot)
-    prefix = (HEADER + ARCHIVE_MARKER + _pretty(stable["archive_articles"])
+    prefix = (_header(instruction_profile) + ARCHIVE_MARKER + _pretty(stable["archive_articles"])
               + MEMORY_MARKER + _pretty(stable["memory_records"]) + DYNAMIC_MARKER)
     metadata = {
         "context_layout_version": LAYOUT_VERSION, "research_mode": research_mode,
@@ -186,9 +193,10 @@ def extract_snapshot(input_text: str, manifest: dict) -> dict:
         if type(snapshot) is not dict:
             raise ContextError("Prepared snapshot must be an object.")
         return snapshot
-    if not input_text.startswith(HEADER + ARCHIVE_MARKER):
+    start = _header(manifest.get("instruction_profile")) + ARCHIVE_MARKER
+    if not input_text.startswith(start):
         raise ContextError("Prepared context header does not match its layout.")
-    archive_text, tail = _split(input_text[len(HEADER + ARCHIVE_MARKER):], MEMORY_MARKER)
+    archive_text, tail = _split(input_text[len(start):], MEMORY_MARKER)
     memory_text, dynamic_text = _split(tail, DYNAMIC_MARKER)
     stable = {"archive_articles": _load(archive_text), "memory_records": _load(memory_text)}
     dynamic = _load(dynamic_text)
@@ -217,6 +225,7 @@ def extract_snapshot(input_text: str, manifest: dict) -> dict:
         snapshot[name] = restored
     built = build_context(snapshot, manifest.get("run_id"),
                           research_mode=manifest.get("research_mode"),
+                          instruction_profile=manifest.get("instruction_profile"),
                           research_as_of=manifest.get("research_as_of"))
     if built.input != input_text or any(manifest.get(key) != value for key, value in built.metadata.items()):
         raise ContextError("Prepared context, research window and manifest do not match.")

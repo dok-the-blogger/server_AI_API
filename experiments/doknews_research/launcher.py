@@ -120,6 +120,7 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
         try:
             built = research_context.build_context(snapshot, state["run_id"],
                                                    research_mode=manifest["research_mode"],
+                                                   instruction_profile=manifest.get("instruction_profile"),
                                                    research_as_of=manifest["research_as_of"])
         except research_context.ContextError as exc:
             raise pilot.PilotError(str(exc)) from exc

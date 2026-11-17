@@ -263,12 +263,11 @@ class ServerFlowTests(unittest.TestCase):
                     with patch.object(server_pilot, "client_for_run", side_effect=AssertionError("check must not open an API client")):
                         with redirect_stdout(output):
                             self.assertEqual(server_main(["check", "--config", "/private/config.json"]), 0)
-                        (self.skill / server_pilot.AI_GUIDE).unlink()
-                        with redirect_stderr(errors):
+                        with patch.object(server_pilot, "RESEARCH_CONTRACT", self.root / "absent-contract.md"), redirect_stderr(errors):
                             self.assertEqual(server_main(["check", "--config", "/private/config.json"]), 2)
         self.assertEqual(json.loads(output.getvalue()), {
             "status": "ready", "api_enabled": True, "model": self.cfg.model,
-            "sdk_version": "3.49.0", "policy_files_count": 5, "api_request_made": False,
+            "sdk_version": "3.49.0", "policy_files_count": 1, "api_request_made": False,
         })
         self.assertEqual(json.loads(errors.getvalue())["error"]["code"], "policy_unavailable")
         self.assertNotIn(str(self.skill), errors.getvalue())
