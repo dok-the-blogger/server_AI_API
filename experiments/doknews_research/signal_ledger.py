@@ -437,14 +437,27 @@ class Ledger:
             return self._get(db, job_id)
 
     def defer_capacity(self, job_id: str, state: dict) -> dict:
-        """Release only a positively rejected Flex create; preserve its replay/history."""
+        """Release a proven Flex rejection, before acceptance or at a terminal root turn."""
         error = state.get("observer_error", {})
+        rejected_create = (state.get("create_accepted") is False
+            and not state.get("session_id") and not state.get("turn_id")
+            and state.get("api_stage") == "create_request"
+            and error.get("http_status") == 429
+            and error.get("error", {}).get("code") == "resource_unavailable"
+            and state.get("failure_code") == "resource_unavailable")
+        proof = state.get("terminal_capacity_proof")
+        rejected_turn = (isinstance(proof, dict) and state.get("create_accepted") is True
+            and bool(state.get("session_id")) and bool(state.get("turn_id"))
+            and proof.get("source") == "root_turn_retrieve" and bool(proof.get("verified_at"))
+            and proof.get("session_id") == state["session_id"]
+            and proof.get("turn_id") == state["turn_id"] and proof.get("status") == "failed"
+            and proof.get("failure_code") == state.get("failure_code") == "flex_unavailable"
+            and state.get("requires_action") is False)
         if (state.get("phase") != "capacity_unavailable" or state.get("service_tier") != "flex"
-                or state.get("create_accepted") is not False or state.get("session_id") or state.get("turn_id")
-                or state.get("api_stage") != "create_request" or state.get("submission_attempts") != 1
-                or error.get("http_status") != 429
-                or error.get("error", {}).get("code") != "resource_unavailable"):
-            raise LedgerError("Capacity deferral requires a confirmed rejected Flex creation.")
+                or state.get("submission_attempts") != 1 or state.get("result_status") is not None
+                or state.get("dossier_file") or state.get("dossier_sha256")
+                or not (rejected_create or rejected_turn)):
+            raise LedgerError("Capacity deferral requires a verified Flex rejection for this attempt.")
         with self._connect(write=True) as db:
             job = self._get(db, job_id)
             if not job.get("run_id") or state.get("run_id") != job["run_id"]:

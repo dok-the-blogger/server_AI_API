@@ -525,7 +525,7 @@ def record_event(run_dir: Path, event):
 
 def request_cancel(client, run_dir: Path, reason: str = "operator") -> dict:
     state = receipt(run_dir)
-    if state["phase"] in TERMINAL:
+    if state["phase"] in TERMINAL | {"capacity_unavailable"}:
         return state
     if not state.get("session_id"):
         raise PilotError("Session ID is unknown. Inspect Platform sessions; do not resubmit this run.")
@@ -571,13 +571,15 @@ def fetch_pages(fetch, **kwargs):
 def recover(client, run_dir: Path):
     """One read-only reconciliation. Does not reconnect a stream or submit any input."""
     state = receipt(run_dir)
-    if state["phase"] in {"prepared", "creation_rejected"} or state.get("session_deleted"):
+    if state["phase"] in {"prepared", "creation_rejected", "capacity_unavailable"} or state.get("session_deleted"):
         return state
     session_id = state.get("session_id")
     if not session_id:
         raise PilotError("Creation outcome is unknown. Inspect Platform sessions before any new run.")
     sessions = client.beta.agents.sessions
     session = as_dict(sessions.retrieve(session_id))
+    if session.get("id") != session_id:
+        raise PilotError("Retrieved session does not match this run.")
     session_usage = session.get("usage")
     spend = session.get("spend_control")
     safe_spend = None
@@ -621,6 +623,19 @@ def recover(client, run_dir: Path):
                            usage_scope="root_turn", usage_is_provisional=True,
                            failure_code=failure_code(turn.get("error")),
                            cancel_confirmed=phase == "cancelled")
+    # An accepted Flex session can still be refused by the provider. Only an
+    # authoritative GET of this exact terminal root turn settles that attempt;
+    # a stream error, a timeout or a locally copied failure code is not proof.
+    if (phase == "failed" and state.get("failure_code") == "flex_unavailable"
+            and state.get("service_tier") == "flex" and state.get("create_accepted") is True
+            and state.get("submission_attempts") == 1 and not state.get("requires_action")
+            and not state.get("dossier_file") and not state.get("dossier_sha256")
+            and state.get("result_status") is None):
+        return update_receipt(run_dir, phase="capacity_unavailable", terminal_capacity_proof={
+            "source": "root_turn_retrieve", "verified_at": now(),
+            "session_id": session_id, "turn_id": turn_id,
+            "status": phase, "failure_code": state["failure_code"],
+        })
     if phase != "completed":
         return state
     items = list(fetch_pages(sessions.turns.items.list, session_id=session_id,

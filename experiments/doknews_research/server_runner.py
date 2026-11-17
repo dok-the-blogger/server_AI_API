@@ -163,6 +163,8 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
                 cfg.flex_max_seconds if cfg.service_tier == "flex" else cfg.max_seconds))
         if completed(state):
             return ledger.finish(job_id, state, run_dir / "dossier.md")
+        if state.get("phase") == "capacity_unavailable":
+            return ledger.defer_capacity(job_id, state)
         return ledger.fail(job_id, state.get("phase", "unknown"), "No verified result")
     except BaseException as exc:
         phase = "preflight_failed"
@@ -198,6 +200,8 @@ def reconcile_job(cfg: ServerConfig, ledger: Ledger, job: dict, *, client_factor
         factory = client_factory or pilot.client_for_run
         with factory(run_dir) as client:
             state = pilot.recover(client, run_dir)
+            if state.get("phase") == "capacity_unavailable":
+                return ledger.defer_capacity(job["job_id"], state)
             deadline = state.get("deadline_epoch")
             last_cancel = state.get("server_cancel_retry_at", 0)
             if type(last_cancel) not in (int, float):
