@@ -134,6 +134,14 @@ def completed(state: dict) -> bool:
     return state.get("phase") == "completed" and state.get("result_status") == "available"
 
 
+def settle_without_dossier(ledger, job_id, state):
+    if state.get("phase") == "capacity_unavailable":
+        return ledger.defer_capacity(job_id, state)
+    if state.get("phase") == "cancelled" and state.get("cancel_confirmed") is True:
+        return ledger.settle_cancelled(job_id, state)
+    return None
+
+
 def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factory=None) -> dict:
     """Claim and freeze before the paid call. Re-entry never calls create again."""
     if not cfg.api_enabled:
@@ -161,8 +169,9 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
                 cfg.flex_max_seconds if cfg.service_tier == "flex" else cfg.max_seconds))
         if completed(state):
             return ledger.finish(job_id, state, run_dir / "dossier.md")
-        if state.get("phase") == "capacity_unavailable":
-            return ledger.defer_capacity(job_id, state)
+        settled = settle_without_dossier(ledger, job_id, state)
+        if settled is not None:
+            return settled
         return ledger.fail(job_id, state.get("phase", "unknown"), "No verified result")
     except BaseException as exc:
         phase = "preflight_failed"
@@ -170,8 +179,9 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
             state = pilot.receipt(run_dir)
             if state.get("submission_attempts", 0):
                 phase = state.get("phase", "unknown")
-            if phase == "capacity_unavailable":
-                return ledger.defer_capacity(job_id, state)
+            settled = settle_without_dossier(ledger, job_id, state)
+            if settled is not None:
+                return settled
         except Exception:
             pass
         ledger.fail(job_id, phase, "Worker stopped; inspect saved receipt")
@@ -191,15 +201,17 @@ def reconcile_job(cfg: ServerConfig, ledger: Ledger, job: dict, *, client_factor
             raise ResearchError("state_integrity", "Saved receipt does not match this job.")
         if completed(state):
             return ledger.finish(job["job_id"], state, run_dir / "dossier.md")
-        if state.get("phase") == "capacity_unavailable":
-            return ledger.defer_capacity(job["job_id"], state)
+        settled = settle_without_dossier(ledger, job["job_id"], state)
+        if settled is not None:
+            return settled
         if not state.get("session_id") or state.get("session_deleted"):
             return job
         factory = client_factory or pilot.client_for_run
         with factory(run_dir) as client:
             state = pilot.recover(client, run_dir)
-            if state.get("phase") == "capacity_unavailable":
-                return ledger.defer_capacity(job["job_id"], state)
+            settled = settle_without_dossier(ledger, job["job_id"], state)
+            if settled is not None:
+                return settled
             deadline = state.get("deadline_epoch")
             last_cancel = state.get("server_cancel_retry_at", 0)
             if type(last_cancel) not in (int, float):
@@ -294,7 +306,7 @@ def worker(cfg: ServerConfig, *, once=False, stop_event=None) -> int:
                 # conversion so shutdown cannot continue with another queued job.
                 if stop_requested.is_set():
                     raise KeyboardInterrupt()
-                settled = result["status"] == "completed" or result.get("failure_phase") == "capacity_unavailable"
+                settled = ledger.blocking_job_id(result["consumer"]) != result["job_id"]
                 heartbeat.update("idle" if settled else "recovery_required", job["job_id"])
                 if once:
                     heartbeat.update("stopped" if settled else "recovery_required", job["job_id"])
