@@ -65,9 +65,10 @@ async def research_readiness(consumer: str, request: Request):
 
 
 @router.get("/research/jobs/{job_id}")
-async def research_job_status(job_id: str, request: Request, proof: bool = False):
+async def research_job_status(job_id: str, request: Request, proof: bool = False, with_readiness: bool = False):
     try:
-        return await asyncio.to_thread(_controller(request).status, job_id, proof=proof)
+        return await asyncio.to_thread(_controller(request).status, job_id,
+                                      proof=proof, with_readiness=with_readiness)
     except ResearchError as exc:
         return _error(exc)
     except Exception:
