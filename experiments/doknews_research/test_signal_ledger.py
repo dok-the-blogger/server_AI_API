@@ -108,7 +108,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(fresh["status"], "queued")
         self.assertEqual(len(fresh["selected_signals"]), 1)
         with sqlite3.connect(self.db_path) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(db.execute("SELECT count(*) FROM researched_signals").fetchone()[0], 0)
 
     def test_uncertain_failures_and_preflight_with_any_session_evidence_remain_blocking(self):

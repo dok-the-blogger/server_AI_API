@@ -50,10 +50,29 @@ class Controller:
             if phase not in ("idle", "running", "recovering", "recovery_required", "configuration_error", "stopped"):
                 fresh = False
                 phase = "unavailable"
+            job_id = state.get("job_id") if fresh and phase in ("recovering", "recovery_required") else None
             return {"phase": phase, "fresh": fresh,
+                    "recovery_job_id": checked_uuid(job_id) if job_id is not None else None,
                     "ready": self.config.api_enabled and fresh and phase in ("idle", "running")}
         except (ResearchError, KeyError, TypeError):
             return {"phase": "unavailable", "fresh": False, "ready": False}
+
+    def readiness(self, consumer: str) -> dict:
+        if consumer not in self.config.consumers:
+            raise ResearchError("consumer_not_configured", "This research consumer is not configured.", 422)
+        worker = self.worker_status()
+        blocker = self.ledger.blocking_job_id(consumer)
+        if not self.config.api_enabled:
+            reason = "research_disabled"
+        elif not worker["ready"]:
+            reason = "worker_not_ready"
+        elif blocker:
+            reason = "consumer_busy"
+        else:
+            reason = "ready"
+        return {"schema_version": 1, "consumer": consumer, "ready": reason == "ready",
+                "reason": reason, "worker_phase": worker["phase"], "worker_fresh": worker["fresh"],
+                "blocking_job_id": blocker or worker.get("recovery_job_id")}
 
     def _run_path(self, job: dict) -> Path | None:
         if not job.get("run_dir"):
@@ -114,10 +133,14 @@ class Controller:
             code = "request_conflict" if "different payload" in str(exc) else "invalid_snapshot"
             raise ResearchError(code, str(exc), 409 if code == "request_conflict" else 422) from None
 
-    def status(self, job_id: str) -> dict:
+    def status(self, job_id: str, *, proof: bool = False) -> dict:
         checked_uuid(job_id)
         try:
-            return self.public_job(self.ledger.get_job(job_id))
+            job = self.ledger.get_job(job_id)
+            result = self.public_job(job)
+            if proof and result.get("receipt") is not None:
+                result["receipt"]["cancel_confirmed"] = bool(job["cancel_verified"])
+            return result
         except LedgerError:
             raise ResearchError("job_not_found", "Research job does not exist.", 404) from None
 

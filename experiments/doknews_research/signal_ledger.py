@@ -24,6 +24,7 @@ UNRESOLVED = ("queued", "running", "unknown", "failed")
 # Keep the failed row and exact-request replay, but do not strand the consumer.
 BLOCKING_SQL = """(status IN ('queued','running','unknown') OR
     (status = 'failed' AND COALESCE(failure_phase, '') != 'capacity_unavailable'
+     AND NOT (COALESCE(failure_phase, '') = 'cancelled' AND cancel_verified = 1)
      AND NOT (COALESCE(failure_phase, '') = 'preflight_failed'
               AND run_id IS NULL AND receipt_json IS NULL)))"""
 FINISHABLE = ("running", "unknown", "failed", "completed")
@@ -167,7 +168,7 @@ class Ledger:
             raise LedgerError("Cannot create or protect the research ledger.") from exc
         with self._connect(write=True) as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise LedgerError("Unsupported research ledger schema.")
             db.execute("""CREATE TABLE IF NOT EXISTS jobs (
                 job_id TEXT PRIMARY KEY, consumer TEXT NOT NULL,
@@ -179,7 +180,10 @@ class Ledger:
                 run_dir TEXT, run_id TEXT, receipt_json TEXT, dossier_sha256 TEXT,
                 failure_phase TEXT, failure_message TEXT,
                 UNIQUE(consumer, request_id))""")
-            if version < 3:
+            if version < 4:
+                if "cancel_verified" not in {row[1] for row in db.execute("PRAGMA table_info(jobs)")}:
+                    db.execute("ALTER TABLE jobs ADD COLUMN cancel_verified INTEGER NOT NULL "
+                               "DEFAULT 0 CHECK(cancel_verified IN (0,1))")
                 db.execute("DROP INDEX IF EXISTS one_unresolved_consumer")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_consumer "
                        "ON jobs(consumer) WHERE " + BLOCKING_SQL)
@@ -192,7 +196,7 @@ class Ledger:
                 fingerprint TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id),
                 researched_at TEXT NOT NULL,
                 PRIMARY KEY(consumer, signal_id, version, fingerprint))""")
-            db.execute("PRAGMA user_version = 3")
+            db.execute("PRAGMA user_version = 4")
 
     @contextmanager
     def _connect(self, write=False):
@@ -241,6 +245,16 @@ class Ledger:
     def get_job(self, job_id: str) -> dict:
         with self._connect() as db:
             return self._get(db, job_id)
+
+    @staticmethod
+    def _blocking_job_id(db, consumer: str) -> str | None:
+        row = db.execute("SELECT job_id FROM jobs WHERE consumer = ? AND " + BLOCKING_SQL,
+                         (consumer,)).fetchone()
+        return row["job_id"] if row else None
+
+    def blocking_job_id(self, consumer: str) -> str | None:
+        with self._connect() as db:
+            return self._blocking_job_id(db, consumer)
 
     def next_queued(self, consumer: str | None = None) -> dict | None:
         """Inspect the oldest queued job. The worker must still call claim()."""
@@ -296,11 +310,9 @@ class Ledger:
             frozen["coverage"]["missing"].append(
                 "Research ledger selected a bounded batch; omitted signals are not included in this request.")
         counts.update(coverage=frozen["coverage"], input_coverage=snapshot["coverage"])
-        blocked = db.execute("SELECT job_id FROM jobs WHERE consumer = ? AND " + BLOCKING_SQL,
-                             (consumer,)).fetchone()
         return {"consumer": consumer, **counts, "selected_signals": selected,
                 "selected_identities": selected_ids, "snapshot": frozen,
-                "blocked_job_id": blocked["job_id"] if blocked else None}
+                "blocked_job_id": self._blocking_job_id(db, consumer)}
 
     def plan(self, consumer: str, snapshot: dict, limit: int = 3) -> dict:
         """Read only. No reservation or research marker is created."""
@@ -393,7 +405,7 @@ class Ledger:
         path = Path(dossier_path).absolute()
         with self._connect(write=True) as db:
             job = self._get(db, job_id)
-            if job["status"] not in FINISHABLE:
+            if job["status"] not in FINISHABLE or job["cancel_verified"]:
                 raise LedgerError("Research job has not been claimed.")
             if not job["run_id"] or receipt.get("run_id") != job["run_id"]:
                 raise LedgerError("Run receipt does not match the research job's bound run.")
@@ -464,13 +476,38 @@ class Ledger:
                 raise LedgerError("Capacity receipt does not match its job.")
             if job["status"] == "failed" and job.get("failure_phase") == "capacity_unavailable":
                 return job
-            if job["status"] not in ("running", "unknown", "failed"):
+            if job["status"] not in ("running", "unknown", "failed") or job["cancel_verified"]:
                 raise LedgerError("Only a claimed, unfinished job can be deferred.")
             db.execute("""UPDATE jobs SET status = 'failed', receipt_json = ?,
                 failure_phase = 'capacity_unavailable', failure_message = ?, updated_at = ?
                 WHERE job_id = ?""", (_json(state), FAILURE_MESSAGE,
                                      _now(), job_id))
             # No researched_signals entry: this was not an investigation.
+            return self._get(db, job_id)
+
+    def settle_cancelled(self, job_id: str, state: dict) -> dict:
+        """Keep the verified root-turn receipt and release without marking signals researched."""
+        # pilot.recover sets cancel_confirmed only after checking the saved session,
+        # root turn and parent IDs. A cancel request or stream event cannot set it.
+        if (state.get("phase") != "cancelled" or state.get("cancel_confirmed") is not True
+                or state.get("create_accepted") is not True or state.get("submission_attempts") != 1
+                or not state.get("session_id") or not state.get("turn_id")
+                or state.get("requires_action") is not False or state.get("result_status") is not None
+                or state.get("dossier_file") or state.get("dossier_sha256")):
+            raise LedgerError("Cancellation requires a verified terminal root turn without a dossier.")
+        with self._connect(write=True) as db:
+            job = self._get(db, job_id)
+            previous = job["receipt"] or {}
+            if (not job["run_id"] or state.get("run_id") != job["run_id"]
+                    or any(previous.get(k) not in (None, state[k]) for k in ("session_id", "turn_id"))
+                    or job["status"] not in ("running", "unknown", "failed")
+                    or job["failure_phase"] == "capacity_unavailable" or job["dossier_sha256"]):
+                raise LedgerError("Cancellation receipt does not match an unfinished bound job.")
+            if job["cancel_verified"]:
+                return job
+            db.execute("""UPDATE jobs SET status = 'failed', failure_phase = 'cancelled',
+                cancel_verified = 1, receipt_json = ?, failure_message = ?, updated_at = ?
+                WHERE job_id = ?""", (_json(state), FAILURE_MESSAGE, _now(), job_id))
             return self._get(db, job_id)
 
     def fail(self, job_id: str, phase: str, message: str) -> dict:
@@ -487,6 +524,8 @@ class Ledger:
         status = "unknown" if phase in ("unknown", "creation_unknown", "submitting", "submission_unknown") else "failed"
         with self._connect(write=True) as db:
             job = self._get(db, job_id)
+            if job["cancel_verified"]:
+                return job
             if job["status"] == "completed":
                 raise LedgerError("A completed research job cannot be changed to failed.")
             db.execute("""UPDATE jobs SET status = ?, failure_phase = ?, failure_message = ?,

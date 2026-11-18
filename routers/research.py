@@ -54,10 +54,20 @@ async def start_research_job(request: Request):
         return _error(ResearchError("research_unavailable", "Research state is temporarily unavailable."))
 
 
-@router.get("/research/jobs/{job_id}")
-async def research_job_status(job_id: str, request: Request):
+@router.get("/research/readiness")
+async def research_readiness(consumer: str, request: Request):
     try:
-        return await asyncio.to_thread(_controller(request).status, job_id)
+        return await asyncio.to_thread(_controller(request).readiness, consumer)
+    except ResearchError as exc:
+        return _error(exc)
+    except Exception:
+        return _error(ResearchError("research_unavailable", "Research state is temporarily unavailable."))
+
+
+@router.get("/research/jobs/{job_id}")
+async def research_job_status(job_id: str, request: Request, proof: bool = False):
+    try:
+        return await asyncio.to_thread(_controller(request).status, job_id, proof=proof)
     except ResearchError as exc:
         return _error(exc)
     except Exception:

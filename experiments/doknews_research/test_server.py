@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import importlib.util
 import io
 import json
+import sqlite3
 from pathlib import Path
 import sys
 import threading
@@ -202,6 +203,81 @@ class ServerFlowTests(unittest.TestCase):
         self.sessions.disconnect = False
         final = reconcile_job(self.cfg, self.controller.ledger, interrupted, client_factory=self.factory)
         self.assertEqual(final["status"], "completed")
+        self.assertEqual(self.sessions.creates, 1)
+
+    def test_old_cancelled_job_settles_once_after_restart_and_keeps_usage(self):
+        self.sessions.disconnect = True
+        self.sessions.status = "in_progress"
+        self.sessions.session_usage = {"input_tokens": 100, "output_tokens": 5, "total_tokens": 105}
+        job_id = self.submit().json()["job_id"]
+        job = execute_job(self.cfg, self.controller.ledger, job_id, client_factory=self.factory)
+        root = Path(job["run_dir"])
+        self.sessions.status = "cancelled"
+        saved = server_pilot.recover(self.client, root)
+        self.controller.ledger.fail(job_id, "cancelled", "v3")
+        # A real v3 schema has neither the verification column nor its index clause.
+        with sqlite3.connect(self.cfg.db_path) as db:
+            db.execute("DROP INDEX one_unresolved_consumer")
+            db.execute("ALTER TABLE jobs DROP COLUMN cancel_verified")
+            db.execute("CREATE UNIQUE INDEX one_unresolved_consumer ON jobs(consumer) WHERE "
+                       "(status IN ('queued','running','unknown') OR (status='failed' AND "
+                       "COALESCE(failure_phase,'')!='capacity_unavailable' AND NOT "
+                       "(COALESCE(failure_phase,'')='preflight_failed' AND run_id IS NULL AND receipt_json IS NULL)))")
+            db.execute("PRAGMA user_version=3")
+        self.controller = self.app.state.research_controller = Controller(self.cfg)
+        ledger = self.controller.ledger
+        self.assertEqual(ledger.blocking_job_id(self.body["consumer"]), job_id)
+        with patch("experiments.doknews_research.server_runner.validate_runtime"), patch.object(
+                server_pilot, "client_for_run", side_effect=AssertionError("already verified")):
+            self.assertEqual(worker(self.cfg, once=True), 0)
+        settled = ledger.get_job(job_id)
+        self.assertEqual(settled["receipt"], saved)
+        self.assertEqual(settled["created_at"], job["created_at"])
+        self.assertEqual(settled["failure_phase"], "cancelled")
+        self.assertEqual(ledger.list_unresolved(), [])
+        self.assertEqual(ledger.settle_cancelled(job_id, saved), settled)
+        self.assertEqual(ledger.fail(job_id, "unknown", "late observer"), settled)
+        self.assertEqual(self.submit().json()["job_id"], job_id)
+        self.assertEqual(self.controller.status(job_id, proof=True)["receipt"]["session_usage"]["total_tokens"], 105)
+        self.assertIs(self.controller.status(job_id, proof=True)["receipt"]["cancel_confirmed"], True)
+        self.heartbeat()
+        fresh = self.submit({**self.body, "request_id": str(uuid.uuid4())})
+        self.assertEqual(fresh.status_code, 202)
+        self.assertNotEqual(fresh.json()["job_id"], job_id)
+        self.assertEqual(fresh.json()["researched_count"], 0)
+        self.assertEqual(self.sessions.creates, 1)
+
+    def test_readiness_reads_only_the_heartbeat_and_blocking_identity(self):
+        url = "/research/readiness?consumer=" + self.body["consumer"]
+        self.assertEqual(self.http.get(url).status_code, 401)
+        def probe():
+            return self.http.get(url, headers=self.headers).json()
+        self.assertEqual(probe()["reason"], "ready")
+        job_id = self.submit().json()["job_id"]
+        self.assertEqual(probe()["reason"], "consumer_busy")
+        self.assertEqual(probe()["blocking_job_id"], job_id)
+        self.assertNotIn("snapshot", probe())
+        (self.cfg.state_dir / "worker-status.json").unlink()
+        self.assertFalse(probe()["ready"])
+        self.assertEqual(probe()["reason"], "worker_not_ready")
+        self.assertEqual(probe()["blocking_job_id"], job_id)
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_cancel_request_event_or_mismatched_receipt_cannot_release(self):
+        self.sessions.disconnect = True
+        self.sessions.status = "in_progress"
+        job_id = self.submit().json()["job_id"]
+        ledger = self.controller.ledger
+        job = execute_job(self.cfg, ledger, job_id, client_factory=self.factory)
+        self.sessions.status = "cancelled"
+        receipt = server_pilot.recover(self.client, Path(job["run_dir"]))
+        for change in ({"cancel_confirmed": False, "cancel_requested": True},
+                       {"phase": "unknown"}, {"run_id": "other"}, {"turn_id": None},
+                       {"result_status": "available"}, {"requires_action": True}):
+            with self.subTest(change=change), self.assertRaises(LedgerError):
+                ledger.settle_cancelled(job_id, {**receipt, **change})
+        ledger.fail(job_id, "cancelled", "event only")
+        self.assertEqual(ledger.blocking_job_id(self.body["consumer"]), job_id)
         self.assertEqual(self.sessions.creates, 1)
 
     def test_failed_cancel_is_retried_at_deadline_with_spacing_and_no_new_create(self):
