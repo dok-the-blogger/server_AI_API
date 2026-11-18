@@ -133,13 +133,19 @@ class Controller:
             code = "request_conflict" if "different payload" in str(exc) else "invalid_snapshot"
             raise ResearchError(code, str(exc), 409 if code == "request_conflict" else 422) from None
 
-    def status(self, job_id: str, *, proof: bool = False) -> dict:
+    def status(self, job_id: str, *, proof: bool = False, with_readiness: bool = False) -> dict:
         checked_uuid(job_id)
         try:
             job = self.ledger.get_job(job_id)
             result = self.public_job(job)
             if proof and result.get("receipt") is not None:
                 result["receipt"]["cancel_confirmed"] = bool(job["cancel_verified"])
+            if with_readiness and job["status"] in ("completed", "failed"):
+                try:
+                    result["queue_readiness"] = self.readiness(job["consumer"])
+                except (LedgerError, ResearchError):
+                    # A failed optional probe must not hide the existing job receipt.
+                    pass
             return result
         except LedgerError:
             raise ResearchError("job_not_found", "Research job does not exist.", 404) from None

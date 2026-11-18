@@ -246,6 +246,11 @@ class ServerFlowTests(unittest.TestCase):
         self.assertNotEqual(fresh.json()["job_id"], job_id)
         self.assertEqual(fresh.json()["researched_count"], 0)
         self.assertEqual(self.sessions.creates, 1)
+        self.assertNotIn("queue_readiness", self.controller.status(job_id))
+        fallback = self.http.get(f"/research/jobs/{job_id}?with_readiness=true", headers=self.headers).json()
+        self.assertEqual(fallback["job_id"], job_id)
+        self.assertEqual(fallback["queue_readiness"]["blocking_job_id"], fresh.json()["job_id"])
+        self.assertFalse(fallback["queue_readiness"]["ready"])
 
     def test_readiness_reads_only_the_heartbeat_and_blocking_identity(self):
         url = "/research/readiness?consumer=" + self.body["consumer"]
