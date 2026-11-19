@@ -39,6 +39,12 @@ class LauncherPreflightTests(unittest.TestCase):
         self.assertTrue(result["new_research"])
         self.assertEqual(result["snapshot_age_minutes"], 6.0)
 
+    def test_environment_must_match_saved_manifest_and_receipt(self):
+        self.prepare(environment_type="none")
+        pilot.update_receipt(self.run_dir, environment_type="openai_hosted")
+        with self.assertRaises(pilot.PilotError):
+            launcher.preflight(self.run_dir, "run", current_time=self.current)
+
     def test_new_signals_window_and_explicit_reasoning_pass_preflight(self):
         self.snapshot["radar_signals"] = [{"signal_id": "s1", "version": 2, "text": "A changed signal"}]
         self.prepare(no_spend_limit=True, research_mode="new_signals", reasoning_effort="medium",
@@ -53,6 +59,10 @@ class LauncherPreflightTests(unittest.TestCase):
 
     def test_legacy_packet_and_astra_model_remain_unchanged_and_compatible(self):
         manifest = self.prepare()
+        del manifest["environment_type"]
+        state = pilot.receipt(self.run_dir)
+        del state["environment_type"]
+        pilot.atomic_bytes(self.run_dir / "receipt.json", pilot.encode(state))
         request = pilot.read_json(self.run_dir / "request.json")
         request["agent"]["model"] = manifest["model"] = "gpt-6-astra"
         request["input"] = (f"Выполни только исследование. DOK_RESEARCH_RUN_ID={manifest['run_id']}.\n\n"

@@ -660,6 +660,24 @@ class PilotProtocolTests(unittest.TestCase):
         self.assertEqual((self.run_dir / "dossier.md").read_text(), "Проверяемое досье")
         self.assertEqual(self.sessions.creates, 1)
 
+    def test_search_audit_counts_known_actions_without_storing_query_text(self):
+        page = "https://example.com/source"
+        def item(index, kind, **kwargs):
+            return {"id": str(index), "type": "web_search_call", "turn_id": TID,
+                    "status": "completed", "action": {"type": kind, **kwargs}}
+        events = [item(1, "search", queries=["A fact", "Different"]),
+                  item(2, "search", query="a  fact"), item(3, "open_page", url=page),
+                  item(4, "open_page", url=page + "#chapter"), item(5, "find_in_page", url=page, pattern="one"),
+                  item(6, "find_in_page", url=page, pattern="two"), item(7, "find_in_page", url=page, pattern="one"),
+                  item(8, "search"), item(9, "other"), {**item(10, "other"), "action": None}]
+        values = [*events, events[0], {**item(11, "search", query="foreign"), "turn_id": "elsewhere"}, message()]
+        audit = pilot.summarize_search(values, TID, [pilot.digest(page.encode())])
+        self.assertEqual(audit["actions"], dict(search=3, open_page=2, find_in_page=3, other=1, unknown=1))
+        self.assertEqual(audit["repeats"], dict(query=1, open_page=1, find_in_page=1))
+        self.assertEqual((audit["queries"], audit["opens_of_radar_urls"], audit["actions_missing_detail"]), (3, 2, 1))
+        self.assertNotIn("A fact", json.dumps(audit))
+        self.assertIsNone(pilot.summarize_search(values, TID, None)["opens_of_radar_urls"])
+
     def test_disconnect_then_resume_uses_same_session_without_new_input(self):
         self.prepare()
         self.sessions.disconnect = True

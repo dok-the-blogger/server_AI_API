@@ -17,7 +17,10 @@ class InstalledSDKContractTests(unittest.TestCase):
     def test_flex_stream_to_saved_dossier_through_installed_sdk(self):
         self.roundtrip("flex")
 
-    def roundtrip(self, service_tier):
+    def test_no_environment_still_uses_live_search_and_returns_text(self):
+        self.roundtrip("flex", "none")
+
+    def roundtrip(self, service_tier, environment_type="openai_hosted"):
         import httpx2
         from openai import OpenAI
 
@@ -30,7 +33,7 @@ class InstalledSDKContractTests(unittest.TestCase):
                    "role": "assistant", "phase": "final_answer", "status": "completed",
                    "content": [{"type": "output_text", "text": "Offline final dossier", "annotations": []}]}
         session = {"id": sid, "object": "agent.session", "agent": {"model": pilot.DEFAULT_MODEL},
-                   "environment": {"type": "openai_hosted"}, "created_at": 1, "last_active_at": 2,
+                   "environment": {"type": environment_type}, "created_at": 1, "last_active_at": 2,
                    "status": "idle", "required_actions": [], "metadata": {}, "vault_ids": [],
                    "usage": usage, "spend_control": {"limit": 300, "consumed": 12}}
         events = [
@@ -63,8 +66,8 @@ class InstalledSDKContractTests(unittest.TestCase):
                 sent = json.loads(request.content)
                 self.assertEqual(sent["spend_control"], {"limit": 300})
                 self.assertEqual(sent["agent"]["service_tier"], service_tier)
-                self.assertEqual(sent["environment"], {"type": "openai_hosted"})
-                self.assertEqual(sent["agent"]["tools"][0]["type"], "web_search")
+                self.assertEqual(sent["environment"], {"type": environment_type})
+                self.assertEqual(sent["agent"]["tools"], [{"type": "web_search", "mode": "live", "context_size": "medium"}])
                 return httpx2.Response(200, headers={"content-type": "text/event-stream"}, stream=IdleThenOpen())
             if request.url.path.endswith("/items"):
                 return httpx2.Response(200, json={"object": "list", "data": [message],
@@ -85,7 +88,7 @@ class InstalledSDKContractTests(unittest.TestCase):
             (folder / "snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
             run_dir = folder / "run"
             pilot.prepare(folder / "skill", folder / "snapshot.json", run_dir, pilot.DEFAULT_MODEL, False,
-                          service_tier=service_tier)
+                          service_tier=service_tier, environment_type=environment_type)
             # No real credential and no network-capable transport are present.
             http = httpx2.Client(transport=httpx2.MockTransport(respond), trust_env=False)
             with OpenAI(api_key="offline-contract-only", http_client=http,
@@ -93,6 +96,7 @@ class InstalledSDKContractTests(unittest.TestCase):
                 result = pilot.run(client, run_dir, 30)
             self.assertEqual(result["phase"], "completed")
             self.assertEqual(result["result_status"], "available")
+            self.assertEqual(result["observed_environment_type"], environment_type)
             self.assertEqual(result["spend_control"]["consumed"], 12)
             self.assertEqual((run_dir / "dossier.md").read_text(), "Offline final dossier")
             self.assertEqual([r.method for r in calls], ["POST", "GET", "GET", "GET"])

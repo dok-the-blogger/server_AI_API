@@ -81,6 +81,7 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
     expected_tools = [{"type": "web_search", "mode": "live", "context_size": "medium"}]
     expected_agent_keys = {"model", "instructions", "tools", "service_tier"}
     reasoning_effort = manifest.get("reasoning_effort")
+    environment_type = manifest.get("environment_type", "openai_hosted")
     if reasoning_effort is not None:
         if type(reasoning_effort) is not str or reasoning_effort not in pilot.REASONING_EFFORTS:
             raise pilot.PilotError("Prepared reasoning effort is unsupported.")
@@ -90,7 +91,9 @@ def preflight(run_dir: Path, action: str, max_snapshot_hours: float = 6,
             or agent.get("service_tier") not in pilot.SERVICE_TIERS
             or agent.get("service_tier") != manifest.get("service_tier", "default")
             or agent.get("service_tier") != state.get("service_tier", "default")
-            or request.get("environment") != {"type": "openai_hosted"}
+            or environment_type not in pilot.ENVIRONMENT_TYPES
+            or environment_type != state.get("environment_type", "openai_hosted")
+            or request.get("environment") != {"type": environment_type}
             or agent.get("model") != manifest.get("model")
             or (reasoning_effort is not None and agent.get("reasoning") != {"effort": reasoning_effort})):
         raise pilot.PilotError("Packet configuration differs from the reviewed web-research pilot.")
