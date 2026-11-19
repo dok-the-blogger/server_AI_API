@@ -41,6 +41,7 @@ POLICY_FILES = (
 AI_GUIDE = "references/DOKNEWS_AI_EDITORIAL_GUIDE.md"
 RESEARCH_CONTRACT = BASE / "research_scope.md"
 SERVICE_TIERS = {"default", "flex"}
+ENVIRONMENT_TYPES = ("openai_hosted", "none")
 SECRET_PATTERN = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{24,}")
 PROJECT_ID_PATTERN = re.compile(r"proj_[A-Za-z0-9_-]{1,100}")
 
@@ -185,9 +186,11 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
             project_id: str | None = None, no_spend_limit: bool = False, *,
             research_mode: str = "general", research_as_of: str | None = None,
             reasoning_effort: str | None = None, service_tier: str = "default",
-            research_only: bool = False):
+            research_only: bool = False, environment_type: str = "openai_hosted"):
     if service_tier not in SERVICE_TIERS or type(research_only) is not bool:
         raise PilotError("Unsupported research profile or service tier.")
+    if environment_type not in ENVIRONMENT_TYPES:
+        raise PilotError("Unsupported session environment.")
     if reasoning_effort is not None and (type(reasoning_effort) is not str or reasoning_effort not in REASONING_EFFORTS):
         raise PilotError("Unsupported explicit reasoning effort.")
     if type(no_spend_limit) is not bool:
@@ -233,7 +236,7 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
             "instructions": instructions,
             "tools": [{"type": "web_search", "mode": "live", "context_size": "medium"}],
         },
-        "environment": {"type": "openai_hosted"},
+        "environment": {"type": environment_type},
         "spend_control": {"limit": spend_limit_cents},
         "metadata": {"dok_research_run_id": run_id, "purpose": "doknews_manual_research_pilot"},
         "input": built_context.input,
@@ -265,6 +268,7 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "instruction_profile": profile,
+        "environment_type": environment_type,
         "instructions_sha256": digest(instructions.encode("utf-8")),
         "context_prefix_sha256": digest((instructions + "\n\n" + built_context.stable_prefix).encode("utf-8")),
         **built_context.metadata,
@@ -278,6 +282,10 @@ def prepare(skill_dir: Path, snapshot_path: Path, run_dir: Path, model: str = DE
         "session_id": None, "turn_id": None, "created_at": now(),
         "request_sha256": manifest["request_sha256"], "usage": None,
         "submission_attempts": 0,
+        "environment_type": environment_type,
+        "radar_url_hashes": sorted({digest(url.strip().partition("#")[0].encode("utf-8"))
+            for signal in snapshot["radar_signals"] for key in ("source_url", "canonical_url")
+            if isinstance(url := signal.get(key), str) and url.strip()}),
         "service_tier": service_tier,
         "spend_limit_cents": spend_limit_cents,
         "research_mode": built_context.metadata["research_mode"],
@@ -573,6 +581,50 @@ def fetch_pages(fetch, **kwargs):
     raise PilotError("Saved history exceeds the pilot retrieval bound; inspect the session directly.")
 
 
+def summarize_search(items: list, turn_id: str, radar_url_hashes: list | None) -> dict:
+    """Aggregate root-turn tool actions locally. These are observations, not billing units."""
+    calls, queries, pages, finds = set(), set(), set(), set()
+    counts = dict(search=0, open_page=0, find_in_page=0, other=0, unknown=0)
+    duplicates = dict(query=0, open_page=0, find_in_page=0)
+    query_count = supplied_opens = missing_detail = 0
+    for item in items:
+        if item.get("type") != "web_search_call" or item.get("turn_id") != turn_id:
+            continue
+        call_id = item.get("id")
+        if not call_id or call_id in calls:
+            continue
+        calls.add(call_id)
+        action = item.get("action") or {}
+        kind = action.get("type")
+        counts[kind if kind in counts else "unknown"] += 1
+        if kind == "search":
+            values = action.get("queries") or [action.get("query")]
+            normalized = [" ".join(q.split()).casefold() for q in values if isinstance(q, str) and q.strip()]
+            missing_detail += not normalized
+            for query in normalized:
+                query_count += 1
+                duplicates["query"] += query in queries
+                queries.add(query)
+        elif kind in ("open_page", "find_in_page"):
+            url = (action.get("url") or "").strip().partition("#")[0]
+            if not url:
+                missing_detail += 1
+            elif kind == "open_page":
+                duplicates[kind] += url in pages
+                pages.add(url)
+                supplied_opens += digest(url.encode("utf-8")) in (radar_url_hashes or ())
+            else:
+                pattern = action.get("pattern")
+                if pattern:
+                    duplicates[kind] += (url, pattern) in finds
+                    finds.add((url, pattern))
+                else:
+                    missing_detail += 1
+    return {"actions": counts, "queries": query_count, "repeats": duplicates,
+            "opens_of_radar_urls": supplied_opens if radar_url_hashes is not None else None,
+            "actions_missing_detail": missing_detail}
+
+
 def recover(client, run_dir: Path):
     """One read-only reconciliation. Does not reconnect a stream or submit any input."""
     state = receipt(run_dir)
@@ -597,7 +649,9 @@ def recover(client, run_dir: Path):
         previous_spend = state.get("spend_control") or {}
         if previous_spend.get("limit") == safe_spend["limit"]:
             safe_spend["consumed"] = previous_spend.get("consumed")
+    environment_type = (session.get("environment") or {}).get("type")
     update_receipt(run_dir, session_status=session.get("status"),
+                   observed_environment_type=environment_type or state.get("observed_environment_type"),
                    requires_action=bool(session.get("required_actions")),
                    spend_control=safe_spend if safe_spend is not None else state.get("spend_control"),
                    latest_spend_unknown=latest_spend_unknown,
@@ -645,6 +699,7 @@ def recover(client, run_dir: Path):
         return state
     items = list(fetch_pages(sessions.turns.items.list, session_id=session_id,
                             turn_id=turn_id, order="asc", limit=100))
+    activity = summarize_search(items, turn_id, state.get("radar_url_hashes"))
     final = []
     for item in items:
         if (item.get("type") == "message" and item.get("role") == "assistant"
@@ -654,9 +709,9 @@ def recover(client, run_dir: Path):
                          if part.get("type") == "output_text" and isinstance(part.get("text"), str))
     text = "\n\n".join(final)
     if not text.strip():
-        return update_receipt(run_dir, result_status="missing_final")
+        return update_receipt(run_dir, result_status="missing_final", web_search_activity=activity)
     save_output(run_dir, text)
-    return update_receipt(run_dir, result_status="available")
+    return update_receipt(run_dir, result_status="available", web_search_activity=activity)
 
 
 def close_session(client, run_dir: Path):

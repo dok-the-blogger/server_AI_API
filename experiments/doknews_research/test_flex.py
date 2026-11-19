@@ -41,6 +41,29 @@ class FlexFlowTests(unittest.TestCase):
         state = pilot.receipt(run_dir)
         self.assertEqual(state["service_tier"], "flex")
         self.assertEqual(self.sessions.creates, 1)
+        self.assertEqual(request["environment"], {"type": "none"})
+        self.assertEqual(request["agent"]["tools"], [{"type": "web_search", "mode": "live", "context_size": "medium"}])
+
+    def test_container_trial_stops_on_three_dossiers_or_six_attempts_after_restart(self):
+        for index in range(4):
+            signal = {**self.snapshot["radar_signals"][0], "signal_id": f"signal{index}"}
+            packet = {**self.body, "request_id": str(uuid.uuid4()),
+                      "snapshot": {**self.snapshot, "radar_signals": [signal]}}
+            job_id = self.submit(packet).json()["job_id"]
+            ledger = Ledger(self.controller.ledger.db_path)
+            completed = execute_job(self.cfg, ledger, job_id, client_factory=self.factory)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(self.sessions.request["environment"]["type"], "none" if index < 3 else "openai_hosted")
+            self.assertEqual(self.submit(packet).json()["job_id"], job_id)
+        self.assertEqual(self.sessions.creates, 4)
+
+    def test_unsuccessful_trial_stops_after_six_ordinary_claims(self):
+        for index in range(7):
+            job_id = self.submit({**self.body, "request_id": str(uuid.uuid4())}).json()["job_id"]
+            ledger = Ledger(self.controller.ledger.db_path)
+            claimed = ledger.claim(job_id, trial_on_flex=True)
+            self.assertEqual(claimed["trial_without_container"], index < 6)
+            ledger.fail(job_id, "preflight_failed", "offline pre-submission failure")
 
     @unittest.skipUnless(importlib.util.find_spec("openai"), "isolated SDK not installed")
     def test_confirmed_capacity_rejection_releases_next_run_but_never_replays(self):
