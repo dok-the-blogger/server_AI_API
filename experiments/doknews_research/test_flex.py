@@ -1,6 +1,7 @@
 """Flex acceptance, bounded failure handling and legacy ledger migration; no network."""
 import importlib.util
 from copy import deepcopy
+from dataclasses import replace
 import json
 import sqlite3
 import unittest
@@ -44,8 +45,11 @@ class FlexFlowTests(unittest.TestCase):
         self.assertEqual(request["environment"], {"type": "none"})
         self.assertEqual(request["agent"]["tools"], [{"type": "web_search", "mode": "live", "context_size": "medium"}])
 
-    def test_container_trial_stops_on_three_dossiers_or_six_attempts_after_restart(self):
-        for index in range(4):
+    def test_no_container_after_completed_trial_and_restarts(self):
+        # Simulate a database carried over from the bounded trial.
+        with sqlite3.connect(self.cfg.db_path) as db:
+            db.execute("CREATE TABLE no_container_trial (job_id TEXT PRIMARY KEY REFERENCES jobs(job_id))")
+        for index in range(7):
             signal = {**self.snapshot["radar_signals"][0], "signal_id": f"signal{index}"}
             packet = {**self.body, "request_id": str(uuid.uuid4()),
                       "snapshot": {**self.snapshot, "radar_signals": [signal]}}
@@ -53,17 +57,23 @@ class FlexFlowTests(unittest.TestCase):
             ledger = Ledger(self.controller.ledger.db_path)
             completed = execute_job(self.cfg, ledger, job_id, client_factory=self.factory)
             self.assertEqual(completed["status"], "completed")
-            self.assertEqual(self.sessions.request["environment"]["type"], "none" if index < 3 else "openai_hosted")
+            self.assertEqual(self.sessions.request["environment"], {"type": "none"})
             self.assertEqual(self.submit(packet).json()["job_id"], job_id)
-        self.assertEqual(self.sessions.creates, 4)
+            if index < 3:
+                with sqlite3.connect(self.cfg.db_path) as db:
+                    db.execute("INSERT INTO no_container_trial VALUES (?)", (job_id,))
+        self.assertEqual(self.sessions.creates, 7)
+        with sqlite3.connect(self.cfg.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM no_container_trial").fetchone(), (3,))
 
-    def test_unsuccessful_trial_stops_after_six_ordinary_claims(self):
-        for index in range(7):
-            job_id = self.submit({**self.body, "request_id": str(uuid.uuid4())}).json()["job_id"]
-            ledger = Ledger(self.controller.ledger.db_path)
-            claimed = ledger.claim(job_id, trial_on_flex=True)
-            self.assertEqual(claimed["trial_without_container"], index < 6)
-            ledger.fail(job_id, "preflight_failed", "offline pre-submission failure")
+    def test_dossier_environment_follows_consumer_even_on_standard_tier(self):
+        cfg = replace(self.cfg, service_tier="default", consumers=("doknews-api-hourly", "other"))
+        self.controller.config = cfg
+        for consumer, environment in (("doknews-api-hourly", "none"), ("other", "openai_hosted")):
+            job = self.submit({**self.body, "consumer": consumer, "request_id": str(uuid.uuid4())}).json()
+            result = execute_job(cfg, self.controller.ledger, job["job_id"], client_factory=self.factory)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(self.sessions.request["environment"], {"type": environment})
 
     @unittest.skipUnless(importlib.util.find_spec("openai"), "isolated SDK not installed")
     def test_confirmed_capacity_rejection_releases_next_run_but_never_replays(self):
