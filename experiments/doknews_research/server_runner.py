@@ -146,7 +146,7 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
     """Claim and freeze before the paid call. Re-entry never calls create again."""
     if not cfg.api_enabled:
         raise ResearchError("research_disabled", "New research is not enabled.")
-    job = ledger.claim(job_id, trial_on_flex=cfg.service_tier == "flex")
+    job = ledger.claim(job_id)
     run_dir = checked_run_path(cfg, job)
     try:
         validate_snapshot(job["snapshot"], cfg)
@@ -160,7 +160,7 @@ def execute_job(cfg: ServerConfig, ledger: Ledger, job_id: str, *, client_factor
             no_spend_limit=True, research_mode="new_signals", research_as_of=utc_now(),
             reasoning_effort=cfg.reasoning_effort,
             service_tier=cfg.service_tier, research_only=True,
-            environment_type="none" if job["trial_without_container"] else "openai_hosted",
+            environment_type="none" if job["consumer"] == "doknews-api-hourly" else "openai_hosted",
         )
         ledger.bind_run(job_id, run_dir, run_id=manifest["run_id"])
         launcher.preflight(run_dir, "run", max_snapshot_hours=cfg.max_snapshot_hours)

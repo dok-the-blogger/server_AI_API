@@ -196,8 +196,6 @@ class Ledger:
                 fingerprint TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id),
                 researched_at TEXT NOT NULL,
                 PRIMARY KEY(consumer, signal_id, version, fingerprint))""")
-            db.execute("""CREATE TABLE IF NOT EXISTS no_container_trial (
-                job_id TEXT PRIMARY KEY REFERENCES jobs(job_id))""")
             db.execute("PRAGMA user_version = 4")
 
     @contextmanager
@@ -372,23 +370,13 @@ class Ledger:
                        (consumer, request_id, payload_sha256, job_id))
             return self._get(db, job_id)
 
-    def claim(self, job_id: str, *, trial_on_flex: bool = False) -> dict:
+    def claim(self, job_id: str) -> dict:
         with self._connect(write=True) as db:
             changed = db.execute("UPDATE jobs SET status = 'running', updated_at = ? WHERE job_id = ? AND status = 'queued'",
                                  (_now(), job_id)).rowcount
             if changed != 1:
                 raise LedgerError("Research job is not queued; it must not be submitted again.")
-            job = self._get(db, job_id)
-            job["trial_without_container"] = False
-            if trial_on_flex and job["consumer"] == "doknews-api-hourly" and job["model"] == "gpt-6.1-sol":
-                # One ordinary job per slot, even across restarts and failed attempts.
-                assigned = db.execute("""INSERT INTO no_container_trial(job_id)
-                    SELECT ? WHERE (SELECT COUNT(*) < 6 AND
-                        COUNT(CASE WHEN jobs.status = 'completed' THEN 1 END) < 3
-                        FROM no_container_trial JOIN jobs USING (job_id))""",
-                    (job_id,))
-                job["trial_without_container"] = assigned.rowcount == 1
-            return job
+            return self._get(db, job_id)
 
     def bind_run(self, job_id: str, run_dir: str | Path, run_id: str | None = None) -> dict:
         path = str(Path(run_dir).absolute())
