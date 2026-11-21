@@ -17,6 +17,11 @@ import re
 import sqlite3
 import uuid
 
+if __package__:
+    from .snapshot_schema import SHA256, SnapshotShapeError, validate_snapshot_shape
+else:
+    from snapshot_schema import SHA256, SnapshotShapeError, validate_snapshot_shape
+
 
 UNRESOLVED = ("queued", "running", "unknown", "failed")
 # execute_job binds run_id before entering any API client. A preparation failure
@@ -40,12 +45,15 @@ CONTENT_FIELDS = (
 )
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 MODEL = re.compile(r"[A-Za-z0-9._-]{1,100}")
-SHA256 = re.compile(r"[a-f0-9]{64}")
 FAILURE_MESSAGE = "Research did not produce a verified result; inspect the saved run receipt."
 
 
 class LedgerError(Exception):
     """Fixed, application-authored messages safe to show without source data."""
+
+
+class InvalidSnapshot(LedgerError):
+    """The request cannot be accepted with this snapshot shape."""
 
 
 class LedgerBusy(LedgerError):
@@ -83,57 +91,13 @@ def signal_fingerprint(signal: dict) -> str:
 
 
 def _snapshot(value: dict) -> tuple[dict, list[dict]]:
-    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 1:
-        raise LedgerError("Snapshot schema_version must be 1.")
-    task = value.get("task")
-    if not isinstance(task, dict) or not all(isinstance(task.get(k), str) and task[k].strip()
-                                             for k in ("name", "topic")):
-        raise LedgerError("Snapshot task requires a nonempty name and topic.")
-    hours = task.get("time_window_hours")
-    if type(hours) is not int or not 1 <= hours <= 168:
-        raise LedgerError("Snapshot time window must be an integer from 1 to 168 hours.")
     try:
-        captured = datetime.fromisoformat(value["captured_at"].replace("Z", "+00:00"))
-        if captured.tzinfo is None:
-            raise ValueError()
-    except (KeyError, ValueError, AttributeError, TypeError) as exc:
-        raise LedgerError("Snapshot captured_at must be an ISO timestamp with a timezone.") from exc
-    coverage = value.get("coverage")
-    if not isinstance(coverage, dict):
-        raise LedgerError("Snapshot must describe source coverage.")
-    if any(coverage.get(key) not in ("not_provided", "partial", "complete")
-           for key in ("archive", "radar", "memory")):
-        raise LedgerError("Snapshot coverage must be not_provided, partial or complete.")
-    if not isinstance(coverage.get("missing"), list) or not all(isinstance(x, str) for x in coverage["missing"]):
-        raise LedgerError("Snapshot coverage.missing must be an array of strings.")
-    for key in ("radar_signals", "archive_articles", "memory_records"):
-        if not isinstance(value.get(key), list) or not all(isinstance(x, dict) for x in value[key]):
-            raise LedgerError("Snapshot signal, article and memory collections must be arrays of objects.")
-    # A JSON round trip freezes the caller's mutable objects and rejects values
-    # SQLite/another process could not reconstruct faithfully.
+        validate_snapshot_shape(value)
+    except SnapshotShapeError as exc:
+        raise InvalidSnapshot(str(exc)) from exc
     frozen = json.loads(_json(value))
-    identities = []
-    seen = set()
-    for signal in frozen["radar_signals"]:
-        signal_id, version = signal.get("signal_id"), signal.get("version")
-        if not isinstance(signal_id, str) or not signal_id.strip() or len(signal_id) > 512:
-            raise LedgerError("Every radar signal requires a nonempty signal_id.")
-        if type(version) is not int or not 1 <= version <= 2**63 - 1:
-            raise LedgerError("Every radar signal requires a positive integer version.")
-        if (signal_id, version) in seen:
-            raise LedgerError("Snapshot contains a duplicate signal_id and version.")
-        seen.add((signal_id, version))
-        for key in ("source_id", "source_url", "title"):
-            if not isinstance(signal.get(key), str) or not signal[key].strip():
-                raise LedgerError("Every radar signal requires source_id, source_url and title.")
-        for key in ("text", "excerpt", "summary", "body"):
-            if key in signal and signal[key] is not None and not isinstance(signal[key], str):
-                raise LedgerError("Radar signal text fields must contain text.")
-        supplied_hash = signal.get("content_sha256")
-        if supplied_hash is not None and (not isinstance(supplied_hash, str) or not SHA256.fullmatch(supplied_hash)):
-            raise LedgerError("Radar content_sha256 must be a lowercase SHA256 digest.")
-        identities.append({"signal_id": signal_id, "version": version,
-                           "fingerprint": signal_fingerprint(signal)})
+    identities = [{"signal_id": signal["signal_id"], "version": signal["version"],
+                   "fingerprint": signal_fingerprint(signal)} for signal in frozen["radar_signals"]]
     return frozen, identities
 
 
@@ -255,6 +219,12 @@ class Ledger:
     def blocking_job_id(self, consumer: str) -> str | None:
         with self._connect() as db:
             return self._blocking_job_id(db, consumer)
+
+    def request_recorded(self, consumer: str, request_id: str) -> bool:
+        with self._connect() as db:
+            return db.execute("""SELECT 1 FROM requests WHERE consumer = ? AND request_id = ?
+                UNION ALL SELECT 1 FROM jobs WHERE consumer = ? AND request_id = ? LIMIT 1""",
+                (consumer, request_id, consumer, request_id)).fetchone() is not None
 
     def next_queued(self, consumer: str | None = None) -> dict | None:
         """Inspect the oldest queued job. The worker must still call claim()."""

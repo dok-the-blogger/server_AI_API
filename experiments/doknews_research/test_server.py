@@ -377,6 +377,43 @@ class ServerFlowTests(unittest.TestCase):
         self.assertIsNone(self.controller.ledger.next_queued())
         self.assertEqual(self.factory_calls, 0)
 
+    def test_invalid_snapshot_identifies_first_attempt_without_creating_work(self):
+        consumer, request_id = self.body["consumer"], self.body["request_id"]
+        malformed = dict(self.snapshot)
+        malformed["editorial_memory"] = malformed.pop("memory_records")
+        for _ in range(2):
+            rejected = self.submit({**self.body, "snapshot": malformed})
+            self.assertEqual(rejected.status_code, 422)
+            detail = rejected.json()["detail"]
+            self.assertIn("memory_records", detail["message"])
+            self.assertEqual(detail["admission"], {
+                "admission": "rejected_before_enqueue", "consumer": consumer,
+                "request_id": request_id, "reason": "invalid_snapshot"})
+            self.assertFalse(self.controller.ledger.request_recorded(consumer, request_id))
+            self.assertIsNone(self.controller.ledger.next_queued())
+        self.assertEqual(self.submit().status_code, 202)
+        self.assertTrue(self.controller.ledger.request_recorded(consumer, request_id))
+        conflict = self.submit({**self.body, "snapshot": malformed})
+        self.assertEqual(conflict.status_code, 409)
+        self.assertNotIn("admission", conflict.json()["detail"])
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_invalid_snapshot_cannot_release_previously_recorded_empty_result(self):
+        body = {**self.body, "snapshot": {**self.snapshot, "radar_signals": []}}
+        self.assertEqual(self.submit(body).json()["status"], "no_signals")
+        invalid = dict(body["snapshot"], memory_records=None)
+        conflict = self.submit({**body, "snapshot": invalid})
+        self.assertEqual(conflict.status_code, 409)
+        self.assertNotIn("admission", conflict.json()["detail"])
+        self.assertEqual(self.submit(body).json()["status"], "no_signals")
+        self.assertEqual(self.sessions.creates, 0)
+
+    def test_unverified_ledger_error_never_certifies_rejection(self):
+        with patch.object(self.controller.ledger, "enqueue", side_effect=LedgerError("failed receipt")):
+            response = self.submit()
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("admission", response.json()["detail"])
+
     def test_stale_new_job_rejected_but_exact_replay_remains_available(self):
         accepted = self.submit().json()
         self.controller.config = replace(self.cfg, max_snapshot_hours=1e-12)
@@ -384,6 +421,7 @@ class ServerFlowTests(unittest.TestCase):
         rejected = self.submit({**self.body, "request_id": str(uuid.uuid4())})
         self.assertEqual(rejected.status_code, 422)
         self.assertEqual(rejected.json()["detail"]["code"], "stale_snapshot")
+        self.assertEqual(rejected.json()["detail"]["admission"]["reason"], "stale_snapshot")
 
     def test_changed_payload_conflict_and_unfinished_result(self):
         accepted = self.submit().json()
