@@ -6,10 +6,10 @@ import hashlib
 from pathlib import Path
 import uuid
 
-from .server_config import (MAX_DOSSIER_BYTES, ResearchError, ServerConfig,
+from .server_config import (MAX_DOSSIER_BYTES, ResearchError, ServerConfig, SnapshotRejected,
                             ensure_state, read_private_json, timestamp,
                             validate_snapshot)
-from .signal_ledger import Ledger, LedgerBusy, LedgerError
+from .signal_ledger import InvalidSnapshot, Ledger, LedgerBusy, LedgerError
 
 
 RECEIPT_FIELDS = (
@@ -106,6 +106,25 @@ class Controller:
                 state.get("usage_refresh_attempted_at") or state.get("updated_at"))
         return result
 
+    def _replay_before_enqueue(self, consumer: str, request_id: str, snapshot: dict) -> dict | None:
+        try:
+            validate_snapshot(snapshot, self.config, check_freshness=False)
+            old = self.ledger.replay(consumer, request_id, snapshot, self.config.model, self.config.max_signals)
+            if old is None:
+                validate_snapshot(snapshot, self.config)
+            return old
+        except (InvalidSnapshot, ResearchError) as exc:
+            if isinstance(exc, ResearchError) and exc.code not in (
+                "invalid_snapshot", "invalid_timestamp", "invalid_json", "stale_snapshot",
+                "secret_in_snapshot", "snapshot_too_large",
+            ):
+                raise
+            # An invalid second payload must never release an already accepted request.
+            if self.ledger.request_recorded(consumer, request_id):
+                raise ResearchError("request_conflict", "Research request ID already recorded.", 409) from None
+            error = exc if isinstance(exc, ResearchError) else ResearchError("invalid_snapshot", str(exc), 422)
+            raise SnapshotRejected(consumer, request_id, error) from None
+
     def submit(self, body: dict) -> dict:
         if not isinstance(body, dict) or set(body) != {"request_id", "consumer", "snapshot"}:
             raise ResearchError("invalid_request", "Supply only request_id, consumer and snapshot.", 422)
@@ -113,12 +132,10 @@ class Controller:
         consumer, snapshot = body["consumer"], body["snapshot"]
         if consumer not in self.config.consumers:
             raise ResearchError("consumer_not_configured", "This research consumer is not configured.", 422)
-        validate_snapshot(snapshot, self.config, check_freshness=False)
         try:
-            old = self.ledger.replay(consumer, request_id, snapshot, self.config.model, self.config.max_signals)
+            old = self._replay_before_enqueue(consumer, request_id, snapshot)
             if old is not None:
                 return self.public_job(old)
-            validate_snapshot(snapshot, self.config)
             # An empty diff can be reported without a live worker or an API key.
             plan = self.ledger.plan(consumer, snapshot, self.config.max_signals)
             if plan["selected_count"] and not self.worker_status()["ready"]:

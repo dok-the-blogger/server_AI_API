@@ -8,7 +8,7 @@ import secrets
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from experiments.doknews_research.server_config import MAX_SNAPSHOT_BYTES, ResearchError
+from experiments.doknews_research.server_config import MAX_SNAPSHOT_BYTES, ResearchError, SnapshotRejected
 
 
 router = APIRouter()
@@ -28,7 +28,10 @@ def _controller(request: Request):
 
 
 def _error(exc: ResearchError):
-    return JSONResponse(status_code=exc.status, content={"detail": {"code": exc.code, "message": str(exc)}})
+    detail: dict = {"code": exc.code, "message": str(exc)}
+    if isinstance(exc, SnapshotRejected):
+        detail["admission"] = exc.admission
+    return JSONResponse(status_code=exc.status, content={"detail": detail})
 
 
 @router.post("/research/jobs")

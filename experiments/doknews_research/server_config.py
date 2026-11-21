@@ -23,6 +23,14 @@ class ResearchError(Exception):
         self.code, self.status = code, status
 
 
+class SnapshotRejected(ResearchError):
+    def __init__(self, consumer: str, request_id: str, error: ResearchError):
+        super().__init__(error.code, str(error), error.status)
+        self.admission = {"consumer": consumer, "request_id": request_id,
+                          "admission": "rejected_before_enqueue",
+                          "reason": "stale_snapshot" if error.code == "stale_snapshot" else "invalid_snapshot"}
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     state_dir: Path
