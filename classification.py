@@ -9,10 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from systemone_models import SystemOneRequest, SystemOneResponse
 
-Intent = Literal["news", "login", "assistant"]
+Intent = Literal["news", "login", "donate", "assistant"]
 NewsMode = Literal["latest", "search"]
 Probability = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
-PROMPT_VERSION = "dokbot-intents-v1"
+PROMPT_VERSION = "dokbot-intents-v2"
 
 # This is one classification request, not a chat or a parameter-generating LLM.
 QUESTIONS = {
@@ -24,12 +24,17 @@ QUESTIONS = {
             "Выбирай по смыслу просьбы, а не по отдельным словам. "
             "Не считай упоминание входа просьбой войти: объяснение работы DOK ID — assistant. "
             "Просьба объяснить или обсудить новость — assistant; найти/показать новости — news. "
-            "Если в сообщении несколько просьб, выбери основную; при равенстве login, затем news."
+            "Для платежа важно, кому предназначена поддержка. В личке просьба о донате без адресата обращена к ДОКу. "
+            "Как поддержать этот стрим — donate, даже если автор спрашивает для друга. "
+            "Как перевести звёзды другому получателю или принимать их на своём канале — assistant. "
+            "Уточнение статуса прежнего платежа, возврат и отказ от оплаты также относятся к assistant. "
+            "Если в сообщении несколько просьб, выбери основную. При равенстве предпочти login, затем news, затем donate."
         ),
         "criteria": {
             "news": "Хочет увидеть свежие новости или найти публикации, в том числе по теме, событию или человеку: что нового, покажи новости про ИИ, найди статью.",
             "login": "Хочет войти/авторизоваться в DOK ID или сервисах ДОКа, получить кнопку, ссылку либо код входа для себя.",
-            "assistant": "Хочет ответ собеседника/ассистента, объяснение, совет, текст, шутку, развлечься; приветствие, общение и остальные сообщения.",
+            "donate": "Просит открыть отправку нового доната ДОКу или спрашивает, как поддержать именно этот стрим. Получатель — ДОК, этот бот либо не назван: «задонатить», «отправить донат», «отправить звёзды», «куда тебе закинуть на стрим?».",
+            "assistant": "Объяснения, советы и разговор. В том числе «как подарить звёзды другу?», «как купить Telegram Stars?», вопросы об уже сделанной оплате, возврате или о самом понятии доната. Также приветствия и прочие сообщения.",
         },
     },
     "news_mode": {
@@ -71,7 +76,7 @@ class ClassificationResponse(BaseModel):
     confidence: Probability
     model: str
     provider: Literal["digitalocean"] = "digitalocean"
-    prompt_version: Literal["dokbot-intents-v1"] = PROMPT_VERSION
+    prompt_version: Literal["dokbot-intents-v2"] = PROMPT_VERSION
     usage: ClassificationUsage
 
 
