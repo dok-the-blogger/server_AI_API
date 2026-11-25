@@ -274,15 +274,17 @@ Jev использует существующий `AI_API_DIGITALOCEAN_API_KEY` 
 `AI_API_JEV_BASE_URL=https://inference.do-ai.run/v1`,
 `AI_API_JEV_MODEL=typesafe-jev-1.13.0`, `AI_API_JEV_TIMEOUT_SECONDS=8`.
 
-Ответ: `intent=news|login|assistant`, `news_mode=latest|search`, `confidence`,
-`model`, `provider`, `prompt_version=dokbot-intents-v1`, `usage` с
-`input_tokens/output_tokens`. Режим новостей — параметр маршрута, а не четвёртое
-намерение. Оба решения получаются за один запрос с общим контекстом.
+Ответ содержит `intent=news|login|donate|assistant`, `news_mode=latest|search`,
+`confidence`, `model`, `provider`, `prompt_version=dokbot-intents-v2` и
+`usage` с `input_tokens/output_tokens`. Оба решения получаются за один запрос.
+Маршрут `donate` означает желание отправить новый донат ДОКу или узнать, как его
+поддержать. Вопросы о прошлом платеже, возврате или переводе другу относятся к
+`assistant`. Запрос публикаций о донатах относится к `news`.
 
 Нет ключа: 503 `classification_not_configured`. Таймаут: 504. Ошибка поставщика:
 502, включая отдельные коды оплаты/доступа; rate limit: 429. Автоповторов и
 подмены генеративной моделью нет; исходные тексты и тела ошибок не журналируются.
-Модель/три намерения задаёт сервис; вызывающий код не может подменить промпт.
+Модель, четыре намерения и инструкции классификатора задаёт сервис.
 Тесты: `python -m pytest -q test_classification.py` (контракт на HTTP-макете,
 не доказательство точности живой модели). Код совместим с прежними зависимостями.
 

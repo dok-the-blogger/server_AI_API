@@ -18,7 +18,7 @@ def provider_result(intent="news", mode="search"):
         return {"type": "choice", "choice": choice, "confidence": 0.98,
                 "probabilities": {option: int(option == choice) for option in options}}
     return {"model": MODEL, "answers": {
-        "intent": answer(intent, ["news", "login", "assistant"]),
+        "intent": answer(intent, ["news", "login", "donate", "assistant"]),
         "news_mode": answer(mode, ["latest", "search"]),
     }, "usage": {"input_tokens": 520, "output_tokens": 60}}
 
@@ -42,23 +42,26 @@ def service(monkeypatch):
         yield client, state
 
 
-@pytest.mark.parametrize("intent,mode", [("news", "latest"), ("news", "search"), ("login", "latest"), ("assistant", "latest")])
-def test_authenticated_route_calls_systemone_once(service, intent, mode):
+@pytest.mark.parametrize("intent,mode,text", [
+    ("news", "latest", "Что нового?"), ("news", "search", "Покажи новости про ИИ"),
+    ("login", "latest", "Хочу войти"), ("donate", "latest", "Хочу отправить звёзды"),
+    ("assistant", "latest", "Что такое Telegram Stars?"),
+])
+def test_authenticated_route_calls_systemone_once(service, intent, mode, text):
     client, state = service
     state["result"] = provider_result(intent, mode)
-    text = "Покажи свежие новости про ИИ"
     response = client.post("/classify/dokbot", headers=AUTH, json={"text": text})
     assert response.status_code == 200
     assert (response.json()["intent"], response.json()["news_mode"]) == (intent, mode)
     assert response.json()["model"] == MODEL
-    assert response.json()["prompt_version"] == "dokbot-intents-v1"
+    assert response.json()["prompt_version"] == "dokbot-intents-v2"
     assert len(state["requests"]) == 1
     request = state["requests"][0]
     assert str(request.url) == "https://inference.do-ai.run/v1/systemone"
     assert request.headers["authorization"] == "Bearer provider-test-key"
     sent = json.loads(request.content)
     assert sent["state"] == {"message": text}
-    assert set(sent["questions"]["intent"]["criteria"]) == {"news", "login", "assistant"}
+    assert set(sent["questions"]["intent"]["criteria"]) == {"news", "login", "donate", "assistant"}
     assert "messages" not in sent
 
 
