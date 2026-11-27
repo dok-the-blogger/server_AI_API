@@ -275,8 +275,10 @@ Jev использует существующий `AI_API_DIGITALOCEAN_API_KEY` 
 `AI_API_JEV_MODEL=typesafe-jev-1.13.0`, `AI_API_JEV_TIMEOUT_SECONDS=8`.
 
 Ответ содержит `intent=news|login|donate|assistant`, `news_mode=latest|search`,
-`confidence`, `model`, `provider`, `prompt_version=dokbot-intents-v2` и
-`usage` с `input_tokens/output_tokens`. Оба решения получаются за один запрос.
+`donation_method=choose|stars|donationalerts|donatepay`, `confidence`, `model`,
+`provider`, `prompt_version=dokbot-intents-v3` и `usage` с `input_tokens/output_tokens`.
+Все три решения получаются за один запрос. Для общей просьбы о донате используется
+`choose`, для явной просьбы о конкретной площадке — её идентификатор.
 Маршрут `donate` означает желание отправить новый донат ДОКу или узнать, как его
 поддержать. Вопросы о прошлом платеже, возврате или переводе другу относятся к
 `assistant`. Запрос публикаций о донатах относится к `news`.

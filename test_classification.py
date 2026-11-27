@@ -13,13 +13,14 @@ AUTH = {"Authorization": "Bearer classifier-test-token"}
 MODEL = "typesafe-jev-1.13.0"
 
 
-def provider_result(intent="news", mode="search"):
+def provider_result(intent="news", mode="search", method="choose"):
     def answer(choice, options):
         return {"type": "choice", "choice": choice, "confidence": 0.98,
                 "probabilities": {option: int(option == choice) for option in options}}
     return {"model": MODEL, "answers": {
         "intent": answer(intent, ["news", "login", "donate", "assistant"]),
         "news_mode": answer(mode, ["latest", "search"]),
+        "donation_method": answer(method, ["choose", "stars", "donationalerts", "donatepay"]),
     }, "usage": {"input_tokens": 520, "output_tokens": 60}}
 
 
@@ -42,19 +43,23 @@ def service(monkeypatch):
         yield client, state
 
 
-@pytest.mark.parametrize("intent,mode,text", [
-    ("news", "latest", "Что нового?"), ("news", "search", "Покажи новости про ИИ"),
-    ("login", "latest", "Хочу войти"), ("donate", "latest", "Хочу отправить звёзды"),
-    ("assistant", "latest", "Что такое Telegram Stars?"),
+@pytest.mark.parametrize("intent,mode,method,text", [
+    ("news", "latest", "choose", "Что нового?"), ("news", "search", "choose", "Покажи новости про ИИ"),
+    ("login", "latest", "choose", "Хочу войти"), ("donate", "latest", "stars", "Хочу отправить звёзды"),
+    ("donate", "latest", "donatepay", "Дай ссылку на DonatePay"),
+    ("donate", "latest", "donationalerts", "Хочу донат через DonationAlerts"),
+    ("donate", "latest", "choose", "Как задонатить?"),
+    ("assistant", "latest", "stars", "Что такое Telegram Stars?"),
 ])
-def test_authenticated_route_calls_systemone_once(service, intent, mode, text):
+def test_authenticated_route_calls_systemone_once(service, intent, mode, method, text):
     client, state = service
-    state["result"] = provider_result(intent, mode)
+    state["result"] = provider_result(intent, mode, method)
     response = client.post("/classify/dokbot", headers=AUTH, json={"text": text})
     assert response.status_code == 200
     assert (response.json()["intent"], response.json()["news_mode"]) == (intent, mode)
     assert response.json()["model"] == MODEL
-    assert response.json()["prompt_version"] == "dokbot-intents-v2"
+    assert response.json()["prompt_version"] == "dokbot-intents-v3"
+    assert response.json()["donation_method"] == (method if intent == "donate" else "choose")
     assert len(state["requests"]) == 1
     request = state["requests"][0]
     assert str(request.url) == "https://inference.do-ai.run/v1/systemone"
@@ -62,6 +67,7 @@ def test_authenticated_route_calls_systemone_once(service, intent, mode, text):
     sent = json.loads(request.content)
     assert sent["state"] == {"message": text}
     assert set(sent["questions"]["intent"]["criteria"]) == {"news", "login", "donate", "assistant"}
+    assert set(sent["questions"]["donation_method"]["criteria"]) == {"choose", "stars", "donationalerts", "donatepay"}
     assert "messages" not in sent
 
 

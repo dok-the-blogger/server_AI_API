@@ -11,8 +11,9 @@ from systemone_models import SystemOneRequest, SystemOneResponse
 
 Intent = Literal["news", "login", "donate", "assistant"]
 NewsMode = Literal["latest", "search"]
+DonationMethod = Literal["choose", "stars", "donationalerts", "donatepay"]
 Probability = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
-PROMPT_VERSION = "dokbot-intents-v2"
+PROMPT_VERSION = "dokbot-intents-v3"
 
 # This is one classification request, not a chat or a parameter-generating LLM.
 QUESTIONS = {
@@ -33,7 +34,7 @@ QUESTIONS = {
         "criteria": {
             "news": "Хочет увидеть свежие новости или найти публикации, в том числе по теме, событию или человеку: что нового, покажи новости про ИИ, найди статью.",
             "login": "Хочет войти/авторизоваться в DOK ID или сервисах ДОКа, получить кнопку, ссылку либо код входа для себя.",
-            "donate": "Просит открыть отправку нового доната ДОКу или спрашивает, как поддержать именно этот стрим. Получатель — ДОК, этот бот либо не назван: «задонатить», «отправить донат», «отправить звёзды», «куда тебе закинуть на стрим?».",
+            "donate": "Хочет отправить новый донат ДОКу, узнать способы поддержки стрима или получить ссылку на DonationAlerts/DonatePay. Получатель — ДОК, этот бот либо не назван: «задонатить», «отправить звёзды», «куда тебе закинуть на стрим?», «дай ссылку на DonatePay».",
             "assistant": "Объяснения, советы и разговор. В том числе «как подарить звёзды другу?», «как купить Telegram Stars?», вопросы об уже сделанной оплате, возврате или о самом понятии доната. Также приветствия и прочие сообщения.",
         },
     },
@@ -43,6 +44,20 @@ QUESTIONS = {
         "criteria": {
             "latest": "Общие новости, свежая подборка: что нового, покажи новости, что интересного сегодня. Конкретная тема не названа.",
             "search": "Поиск новостей по названной теме, человеку, продукту, событию или конкретной статьи: новости ИИ, что нового у OpenAI, найди статью про Star Trek.",
+        },
+    },
+    "donation_method": {
+        "type": "choice",
+        "instructions": (
+            "Какой способ пользователь выбрал для нового доната ДОКу? Выбирай только явно запрошенный способ. "
+            "Если пользователь перечисляет варианты, исключает способ, не указывает способ или не просит "
+            "отправить новый донат этому стримеру, выбери choose. Сама по себе сумма в рублях не задаёт способ."
+        ),
+        "criteria": {
+            "choose": "Общий вопрос о поддержке, несколько подходящих способов, способ не выбран или речь не о новом донате ДОКу.",
+            "stars": "Хочет отправить звёзды Telegram (Stars, старсы, ⭐) или сделать донат ими.",
+            "donationalerts": "Хочет донат через DonationAlerts (Donation Alerts, донейшен алертс), просит ссылку именно туда.",
+            "donatepay": "Хочет донат через DonatePay (Donate Pay, донатпей), просит ссылку именно туда.",
         },
     },
 }
@@ -73,10 +88,11 @@ class ClassificationUsage(BaseModel):
 class ClassificationResponse(BaseModel):
     intent: Intent
     news_mode: NewsMode
+    donation_method: DonationMethod
     confidence: Probability
     model: str
     provider: Literal["digitalocean"] = "digitalocean"
-    prompt_version: Literal["dokbot-intents-v2"] = PROMPT_VERSION
+    prompt_version: Literal["dokbot-intents-v3"] = PROMPT_VERSION
     usage: ClassificationUsage
 
 
@@ -101,9 +117,11 @@ class JevClassifier:
         result = await self.decide(SystemOneRequest(
             model=self.model, state={"message": text}, questions=QUESTIONS,
         ))
+        intent = result.answers["intent"].choice
         return ClassificationResponse(
-            intent=result.answers["intent"].choice,
+            intent=intent,
             news_mode=result.answers["news_mode"].choice,
+            donation_method=result.answers["donation_method"].choice if intent == "donate" else "choose",
             confidence=result.answers["intent"].confidence,
             model=result.model,
             usage=ClassificationUsage.model_validate(result.usage.model_dump()),
